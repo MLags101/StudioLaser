@@ -86,11 +86,12 @@ QLabel {{ background: transparent; }}
 QLabel#heading {{ font-size: 9pt; font-weight: 700; color: {t['muted']}; letter-spacing: 1px; padding-top: 6px; }}
 QLabel#title {{ font-size: 13pt; font-weight: 600; }}
 QLabel#muted, QLabel#hint {{ color: {t['muted']}; }}
-QLabel#chip {{ border-radius: 10px; padding: 3px 10px; font-weight: 600; background: {t['raised']};
+#chip {{ border-radius: 10px; padding: 3px 10px; font-weight: 600; background: {t['raised']};
     border: 1px solid {t['border']}; }}
-QLabel#chip[state="ok"] {{ background: {t['success']}; color: #ffffff; border-color: {t['success']}; }}
-QLabel#chip[state="bad"] {{ background: {t['danger']}; color: #ffffff; border-color: {t['danger']}; }}
-QLabel#chip[state="warn"] {{ background: {t['warning']}; color: #1a1200; border-color: {t['warning']}; }}
+#chip::menu-indicator {{ image: none; width: 0; }}
+#chip[state="ok"] {{ background: {t['success']}; color: #ffffff; border-color: {t['success']}; }}
+#chip[state="bad"] {{ background: {t['danger']}; color: #ffffff; border-color: {t['danger']}; }}
+#chip[state="warn"] {{ background: {t['warning']}; color: #1a1200; border-color: {t['warning']}; }}
 QLabel#issue[level="error"] {{ color: {t['danger']}; }}
 QLabel#issue[level="warning"] {{ color: {t['warning']}; }}
 QFrame#banner {{ background: {t['danger']}; border-radius: 6px; }}
@@ -177,7 +178,7 @@ def _check_image() -> str:
     import tempfile
     from pathlib import Path
 
-    path = Path(tempfile.gettempdir()) / 'openlaser-check.png'
+    path = Path(tempfile.gettempdir()) / 'studiolaser-check.png'
     pixmap = QPixmap(30, 30)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)

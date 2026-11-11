@@ -31,7 +31,8 @@ GUIDE = """<h3>Two-sided PCB, start to finish</h3>
 <li><b>Calibrate Lens</b> (once per lens): mark a grid on card, measure it, apply. Then align the red light.</li>
 <li><b>Material test</b> (once per laminate): run a test matrix and the kerf ladder on scrap, save the best patch as a preset and make it the default.</li>
 <li><b>Import PCB</b>: copper, mask, silkscreen, outline and drill files, exported 1:1 and unmirrored.</li>
-<li><b>Top side</b>: place the board, <b>Register on holes</b> with the red light, frame to check, tick <i>Side and alignment checked</i>, Preview, Arm, Start.</li>
+<li><b>Top side</b>: place the board, <b>Frame</b> and move it until the red outline and hole rings sit on the board, or <b>Register</b> on
+holes or on the board edge, frame to check, tick <i>Side and alignment checked</i>, Preview, Arm, Start.</li>
 <li><b>Flip</b> the board, select the bottom side, register it on the same holes, and run it the same way.</li>
 </ol>
 <p><b>Stop</b> (or Esc) is always available. Wear eyewear rated for 1064 nm and run the fume extraction.</p>"""
@@ -55,13 +56,18 @@ class EscapeStops(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, state_dir: Path | None = None, controller: AppController | None = None):
         super().__init__()
-        self.setWindowTitle("OpenLaser")
+        self.setWindowTitle("StudioLaser")
         self.resize(1320, 840)
         self.setMinimumSize(900, 600)
         self.setAcceptDrops(True)
         self.setDockNestingEnabled(True)
         self.controller = controller or AppController(state_dir)
-        self.settings = QSettings("OpenLaser", "Desktop")
+        self.settings = QSettings("StudioLaser", "Desktop")
+        if not self.settings.allKeys():
+            # First start after the rename: keep window layout, theme, folders and laser choice.
+            former = QSettings("OpenLaser", "Desktop")
+            for key in former.allKeys():
+                self.settings.setValue(key, former.value(key))
         self.registration = None
         self.calibration = None
         self._closing = False
@@ -133,6 +139,7 @@ class MainWindow(QMainWindow):
         if geometry:
             self.restoreGeometry(geometry)
             self.restoreState(self.settings.value("state", b""))
+        c.device_choice = str(self.settings.value("usb_device", "") or "")
         c.load_state()
         self.refresh()
         QTimer.singleShot(0, self.canvas.fit)
@@ -259,10 +266,16 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(corner)
         layout.setContentsMargins(0, 3, 8, 3)
         layout.setSpacing(10)
-        self.chip = QLabel("Laser offline")
+        # The connection chip is also the laser picker: click it to choose which USB laser to use.
+        self.chip = QToolButton()
         self.chip.setObjectName("chip")
-        self.chip.setMinimumWidth(150)
-        self.chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.chip.setText("Laser offline")
+        self.chip.setMinimumWidth(170)
+        self.chip.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.chip.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.device_menu = QMenu(self.chip)
+        self.device_menu.aboutToShow.connect(self.fill_device_menu)
+        self.chip.setMenu(self.device_menu)
         layout.addWidget(self.chip)
         self.stop_button = QToolButton()
         self.stop_button.setObjectName("stop")
@@ -309,7 +322,8 @@ class MainWindow(QMainWindow):
             self.chip.setText("Engraving")
             state = "bad"
         self.chip.setProperty("state", state)
-        self.chip.setToolTip(c.link_note)
+        self.chip.setText(self.chip.text() + "  ▾")
+        self.chip.setToolTip(f"{c.link_note}\nClick to choose which laser to use.")
         self.chip.style().unpolish(self.chip)
         self.chip.style().polish(self.chip)
         self.banner.setVisible(c.state_unknown)
@@ -320,9 +334,43 @@ class MainWindow(QMainWindow):
             f"{profile.name} · {profile.lens or 'no lens set'} · field {profile.width:g} × {profile.height:g} mm"
             + (f" · calibrated {profile.calibration_note.split(',')[0]}" if profile.calibration else " · lens not calibrated")
             if profile.enabled else "Machine not set up — framing and marking are disabled")
-        self.setWindowTitle(("OpenLaser — " + c.project_path.name) if c.project_path else "OpenLaser")
+        self.setWindowTitle(("StudioLaser — " + c.project_path.name) if c.project_path else "StudioLaser")
         if self._closing and not c.busy:
             self.close()
+
+    def fill_device_menu(self):
+        from ..cli import usb_label
+
+        c = self.controller
+        menu = self.device_menu
+        menu.clear()
+        group = QActionGroup(menu)
+
+        def choice(text, key, *, enabled=True):
+            action = menu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(c.device_choice == key)
+            action.setEnabled(enabled and not c.busy)
+            action.triggered.connect(lambda _=False, key=key: self.set_device(key))
+            group.addAction(action)
+
+        choice("Automatic — the only laser connected", "")
+        menu.addSeparator()
+        keys = [device["key"] for device in c.usb_devices]
+        for number, key in enumerate(keys, start=1):
+            choice(f"Laser {number} — {usb_label(key)}", key)
+        if c.device_choice and c.device_choice not in keys:
+            choice(f"{usb_label(c.device_choice)} (not connected)", c.device_choice)
+        if not keys:
+            menu.addAction("No lasers found on USB").setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Check USB again", c.refresh_devices)
+        if c.busy:
+            menu.addAction("Stop the laser to switch lasers").setEnabled(False)
+
+    def set_device(self, key: str):
+        if self.controller.set_device(key):
+            self.settings.setValue("usb_device", key)
 
     def set_frame_mode(self, key: str):
         self.settings.setValue("frame_mode", key)
@@ -390,7 +438,7 @@ class MainWindow(QMainWindow):
 
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open project", self._folder("project_folder"),
-                                              "OpenLaser project (*.openlaser.json);;JSON (*.json)")
+                                              "StudioLaser project (*.studiolaser.json *.openlaser.json);;JSON (*.json)")
         if path:
             self._remember(path, "project_folder")
             self.controller.open_project(Path(path))
@@ -399,10 +447,10 @@ class MainWindow(QMainWindow):
         path = self.controller.project_path
         if path is None or as_new:
             name, _ = QFileDialog.getSaveFileName(self, "Save project", self._folder("project_folder"),
-                                                  "OpenLaser project (*.openlaser.json)")
+                                                  "StudioLaser project (*.studiolaser.json)")
             if not name:
                 return
-            path = Path(name if name.lower().endswith(".json") else name + ".openlaser.json")
+            path = Path(name if name.lower().endswith(".json") else name + ".studiolaser.json")
             self._remember(path, "project_folder")
         self.controller.save_project(path)
         self.refresh()
@@ -483,7 +531,7 @@ class MainWindow(QMainWindow):
 
     def open_registration(self):
         job = self.controller.job
-        if job is None or not job.references or not self.controller.can_edit():
+        if job is None or not (job.references or job.boundary) or not self.controller.can_edit():
             return
         if self.registration is not None:
             self.registration.close()

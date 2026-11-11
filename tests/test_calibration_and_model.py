@@ -235,7 +235,7 @@ def test_project_round_trip_and_version_one_files(tmp_path):
     layer = LayerSpec("a", "a", VECTOR_ENGRAVE, 50, 45, 200, 1000)
     job = Job("J", (Artwork("A", (((0, 0), (1, 0)),), (), layer, COPPER_FILL),), Placement(1, 2, 3, 1.5, True),
               job_id="one", holes=False)
-    path = tmp_path / "p.openlaser.json"
+    path = tmp_path / "p.studiolaser.json"
     save_project(path, [job])
     assert open_project(path) == [job]
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -323,3 +323,42 @@ def test_ezcad_pen_library_gives_timing_and_the_operators_sets():
     assert DeviceProfile.from_dict(profile.to_dict()).delays["delay_laser_on"] == -300
     with pytest.raises(ValueError, match="delay"):
         replace(profile, delays={"delay_polygon": -5}).validate()
+
+
+def test_cached_hull_bounds_match_a_full_point_scan():
+    import random
+
+    random.seed(3)
+    paths = tuple(tuple((random.uniform(-20, 20), random.uniform(-10, 10)) for _ in range(30)) for _ in range(40))
+    layer = LayerSpec("a", "a", VECTOR_ENGRAVE, 50, 45, 200, 1000)
+    job = Job("J", (Artwork("A", paths, (), layer),), Placement(7, -3, 33, 1.2, True), job_id="h")
+    placed = [job.placement.apply(point) for path in paths for point in path]
+    xs, ys = zip(*placed)
+    assert job.bounds() == pytest.approx((min(xs), min(ys), max(xs), max(ys)))
+    assert len(job.hull) < 40
+    assert job.placement.invert(job.placement.apply((1.5, -2.5))) == pytest.approx((1.5, -2.5))
+
+
+def test_edge_fit_needs_two_edges_and_reports_distance_to_the_edge():
+    from mopa_luiz.workspace import fit_to_outline
+
+    outline = (rectangle(-20, -12, 20, 12),)
+    true = Placement(3.7, -2.1, 4.0)
+    on_edges = [true.apply(point) for point in ((-8, 12), (9, 12), (20, 3), (-20, -5))]
+    fit = fit_to_outline(outline, on_edges, Placement(2.5, -1.0, 2.0))
+    assert fit.well_posed and fit.worst < 1e-6
+    assert (fit.placement.x, fit.placement.y, fit.placement.angle) == pytest.approx((3.7, -2.1, 4.0), abs=1e-5)
+    one_edge = fit_to_outline(outline, [true.apply(p) for p in ((-10, 12), (0, 12), (10, 12))], Placement(3, -2, 3))
+    assert not one_edge.well_posed
+    # A point 1 mm from a corner, started 1.5 mm off: matched to its own edge, not the neighbouring one.
+    picked = [(-19, 12), (9, 12), (20, 3), (-20, -11)]
+    near_corner = [true.apply(point) for point in picked]
+    guided = fit_to_outline(outline, near_corner, Placement(2.2, -0.6, 2.0), picked=picked)
+    assert (guided.placement.x, guided.placement.y, guided.placement.angle) == pytest.approx((3.7, -2.1, 4.0), abs=1e-5)
+    from mopa_luiz.workspace import edge_run
+    assert edge_run(outline, (5, 12)) in (((20, 12), (-20, 12)), ((-20, 12), (20, 12)))
+    off = list(on_edges)
+    off[0] = (off[0][0], off[0][1] + 0.3)                  # one point measured 0.3 mm off the edge
+    assert 0.05 < fit_to_outline(outline, off, Placement(3, -2, 3)).worst < 0.3
+    with pytest.raises(ValueError, match="three"):
+        fit_to_outline(outline, on_edges[:2], Placement())

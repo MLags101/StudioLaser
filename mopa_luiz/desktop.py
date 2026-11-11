@@ -1,4 +1,4 @@
-"""Entry point for the OpenLaser desktop application."""
+"""Entry point for the StudioLaser desktop application."""
 
 from __future__ import annotations
 
@@ -34,10 +34,13 @@ def main(argv: list[str] | None = None) -> int:
     from .gui import theme
     from .gui.main_window import MainWindow
 
-    app = QApplication.instance() or QApplication(sys.argv if argv is None else ["openlaser", *argv])
-    app.setApplicationName("OpenLaser")
-    app.setOrganizationName("OpenLaser")
-    theme.apply(app, QSettings("OpenLaser", "Desktop").value("theme", "") or None)
+    app = QApplication.instance() or QApplication(sys.argv if argv is None else ["studiolaser", *argv])
+    app.setApplicationName("StudioLaser")
+    app.setOrganizationName("StudioLaser")
+    saved = QSettings("StudioLaser", "Desktop").value("theme", None)
+    if saved is None:   # first start after the rename
+        saved = QSettings("OpenLaser", "Desktop").value("theme", "")
+    theme.apply(app, saved or None)
     for base in (Path(getattr(sys, "_MEIPASS", "")), Path(__file__).resolve().parents[1]):
         icon = base / "assets" / "icons" / "openmopa.ico"
         if icon.is_file():
@@ -54,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             window.controller.say(f"Unexpected error: {value}", "error")
         except Exception:
             pass
-        box = QMessageBox(QMessageBox.Icon.Critical, "OpenLaser", f"An unexpected error occurred:\n{value}")
+        box = QMessageBox(QMessageBox.Icon.Critical, "StudioLaser", f"An unexpected error occurred:\n{value}")
         box.setDetailedText(text)
         box.exec()
 

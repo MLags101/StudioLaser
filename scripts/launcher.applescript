@@ -1,14 +1,14 @@
--- OpenLaser launcher: starts the desktop workspace from the project's .venv.
+-- StudioLaser launcher: starts the desktop workspace from the project's .venv.
 
 set appPath to POSIX path of (path to me)
 -- The app is expected to live in the project root (see README). Resolve the
 -- folder that contains the .app bundle.
 set projectPath to do shell script ("dirname " & quoted form of appPath)
-set desktopApp to projectPath & "/.venv/bin/openlaser-desktop"
+set desktopApp to projectPath & "/.venv/bin/studiolaser-desktop"
 try
     do shell script ("test -x " & quoted form of desktopApp)
 on error
-    display dialog "OpenLaser.app must stay in the OpenLaser project folder (next to .venv). Could not find " & desktopApp & ". Run 'Install OpenLaser.command' again." buttons {"OK"} default button "OK" with icon stop
+    display dialog "StudioLaser.app must stay in the StudioLaser project folder (next to .venv). Could not find " & desktopApp & ". Run 'Install StudioLaser.command' again." buttons {"OK"} default button "OK" with icon stop
     return
 end try
 

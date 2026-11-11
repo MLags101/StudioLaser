@@ -47,7 +47,7 @@ class DetectHintTests(unittest.TestCase):
     def test_linux_permission_hint(self):
         with mock.patch.object(cli.sys, "platform", "linux"):
             hint = cli.detect_hint(seen_by_os=True, usable=False, libusb_ok=True)
-        self.assertIn("99-openlaser.rules", hint)
+        self.assertIn("99-studiolaser.rules", hint)
 
     def test_unplugged_laser_hint(self):
         hint = cli.detect_hint(seen_by_os=False, usable=False, libusb_ok=True)

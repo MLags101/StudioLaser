@@ -280,7 +280,7 @@ def test_arm_expiration_one_shot_registration_and_project_resume(tmp_path):
     assert error == 0 and pose.angle == 90
     assert pose.apply((5, 0)) == pytest.approx((2, 8))
     job = replace(make_job((((0, 0), (2, 0)),)), placement=pose, status="running")
-    path = tmp_path / "queue.openlaser.json"
+    path = tmp_path / "queue.studiolaser.json"
     save_project(path, [job])
     assert open_project(path) == [replace(job, status="interrupted")]
 

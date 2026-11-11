@@ -2,7 +2,7 @@
 
 Two independent layers correct the galvo field.
 
-* The controller board applies a 65x65 offset table. OpenLaser uploads a
+* The controller board applies a 65x65 offset table. StudioLaser uploads a
   factory ``.cor`` file verbatim and never edits its contents, because the
   table's sign and axis conventions are only known from the factory tool.
 * ``FieldMap`` is a polynomial that maps a target position in millimetres to
@@ -155,7 +155,7 @@ class EzcadField:
             "scale_x", "scale_y", "bulge_x", "bulge_y", "skew_x", "skew_y", "trapezoid_x", "trapezoid_y"))
 
     def field_map(self, half: float, *, distortion: bool) -> FieldMap:
-        """Offset and rotation always apply. The distortion terms are OpenLaser's
+        """Offset and rotation always apply. The distortion terms are StudioLaser's
         approximation of EZCAD's undocumented model; measure and calibrate."""
         angle = math.radians(self.angle)
         c, s = math.cos(angle), math.sin(angle)

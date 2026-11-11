@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from ..cli import pyusb_probe
+from ..cli import pyusb_probe, usb_label
 from ..desktop_hardware import HardwareWorker
 from ..device_profile import DeviceProfile
 from ..job_planner import Arming, MarkPlan, compile_frame, compile_mark, format_duration
@@ -42,28 +42,50 @@ LINK_TEXT = {
     "connected": "Laser connected",
     "mock": "Simulated laser",
     "offline": "Laser offline",
-    "multiple": "Two lasers found",
+    "multiple": "Choose a laser",
+    "missing": "Selected laser missing",
     "driver": "Wrong USB driver",
 }
 
 
+def same_geometry(a: Job, b: Job) -> bool:
+    """True when two versions of a job share every path (edits replace settings, not geometry)."""
+    return (a.boundary is b.boundary and a.retained is b.retained and len(a.objects) == len(b.objects)
+            and all(x.paths is y.paths and x.fills is y.fills for x, y in zip(a.objects, b.objects)))
+
+
 def state_directory() -> Path:
-    root = os.environ.get("LOCALAPPDATA")
-    return (Path(root) if root else Path.home() / ".config") / "OpenLaser"
+    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
+    current, former = root / "StudioLaser", root / "OpenLaser"
+    if not current.exists() and former.is_dir():
+        # First start after the rename: bring the machine profile, presets and job list across.
+        import shutil
+
+        try:
+            shutil.copytree(former, current, ignore=shutil.ignore_patterns("*.lock"))
+        except OSError:
+            pass
+    return current
 
 
-def probe_link() -> tuple[str, str]:
+def probe_link(choice: str = "") -> tuple[str, str, list[dict]]:
+    """(link state, explanation, lasers found). ``choice`` is the laser the operator picked, or "" for automatic."""
     if mock_mode():
-        return "mock", "OPENMOPA_MOCK=1: commands go to a simulated controller, not a laser."
+        return "mock", "OPENMOPA_MOCK=1: commands go to a simulated controller, not a laser.", []
     report = pyusb_probe()
-    count = len(report["devices"])
-    if count == 1:
-        return "connected", "One JCZ/LMC controller found on USB."
-    if count > 1:
-        return "multiple", "More than one JCZ/LMC controller is connected. Leave exactly one plugged in."
+    devices = report["devices"]
+    if choice:
+        if any(device["key"] == choice for device in devices):
+            return "connected", f"Using the laser on {usb_label(choice)}.", devices
+        return "missing", (f"The selected laser ({usb_label(choice)}) is not connected. Plug it in, or choose "
+                           "another laser in this menu."), devices
+    if len(devices) == 1:
+        return "connected", f"One JCZ/LMC laser found, on {usb_label(devices[0]['key'])}.", devices
+    if len(devices) > 1:
+        return "multiple", "More than one JCZ/LMC laser is connected. Choose which one to use in this menu.", devices
     if not report.get("available"):
-        return "offline", report.get("note") or "The USB library could not be loaded."
-    return "offline", "No JCZ/LMC controller found. Check the laser's power and USB cable."
+        return "offline", report.get("note") or "The USB library could not be loaded.", devices
+    return "offline", "No JCZ/LMC laser found. Check the laser's power and USB cable.", devices
 
 
 def probe_driver() -> tuple[str, str] | None:
@@ -125,11 +147,16 @@ class AppController(QObject):
         self.target = None            # red-light paths that replace the job outline
         self.frame_mode = "holes"
         self.link = "offline"
+        self.usb_devices: list[dict] = []   # lasers found on the last USB check
+        self.device_choice = ""              # the laser to use; "" means the only one connected
         self.link_note = ""
         self.state_unknown = False
         self.running_id: str | None = None
         self.worker = HardwareWorker()
         self.executor = ThreadPoolExecutor(max_workers=2)
+        self._saver = ThreadPoolExecutor(max_workers=1)   # one writer, so saves land in order
+        self._save_future = None
+        self._save_errors: list[BaseException] = []
         self.tasks: list[tuple[str, int, object]] = []
         self.undo_stack: list[tuple[tuple[Job, ...], int, str, float]] = []
         self.redo_stack: list[tuple[tuple[Job, ...], int]] = []
@@ -286,8 +313,13 @@ class AppController(QObject):
         # A job whose geometry or position changed is no longer verified against the board.
         for job in self.jobs:
             was = old.get(job.job_id)
-            if was is not None and (was.placement != job.placement or was.boundary != job.boundary):
+            if was is None or was is job:
+                continue
+            if was.placement != job.placement or (was.boundary is not job.boundary and was.boundary != job.boundary):
                 self.verified.discard(job.job_id)
+            # A settings edit makes a new job with the same geometry; keep its hull rather than recompute it.
+            if "hull" in was.__dict__ and "hull" not in job.__dict__ and same_geometry(was, job):
+                job.__dict__["hull"] = was.__dict__["hull"]
         self.verified &= {job.job_id for job in self.jobs}
         self.invalidate()
         self._recovery_dirty = True
@@ -422,6 +454,28 @@ class AppController(QObject):
             self.arming.clear()
         self.state_changed.emit()
 
+    def set_device(self, key: str) -> bool:
+        """Use this laser from now on ("" = automatic, the only one connected)."""
+        if key == self.device_choice:
+            return True
+        if self.busy:
+            self.say("Stop the laser before switching to another one.", "warning")
+            return False
+        self.device_choice = key
+        self.invalidate()
+        if self.verified:
+            # Alignment was checked on the other machine's bed.
+            self.verified.clear()
+        self.link, self.link_note = "offline", "Checking the selected laser…"
+        self._last_detect = 0.0
+        self.say(f"Using the laser on {usb_label(key)}." if key else
+                 "Using whichever single laser is connected.")
+        self.state_changed.emit()
+        return True
+
+    def refresh_devices(self) -> None:
+        self._last_detect = 0.0
+
     # ---- machine profile and presets
 
     def set_profile(self, profile: DeviceProfile) -> bool:
@@ -486,15 +540,37 @@ class AppController(QObject):
     # ---- projects and recovery
 
     def flush_recovery(self, *, strict: bool = False) -> None:
+        """Save the job list for crash recovery. Routine saves run in the background; a strict save
+        (before a job starts or after it ends) waits and raises, because it records job status."""
         if not self._recovery_dirty or self._recovery_blocked:
             return
-        try:
-            save_project(self.state_dir / "recovery.json", self.jobs)
-            self._recovery_dirty = False
-        except Exception as exc:
-            if strict:
+        path, jobs = self.state_dir / "recovery.json", list(self.jobs)
+        self._recovery_dirty = False
+        if strict:
+            self._wait_for_save()
+            try:
+                save_project(path, jobs)
+            except Exception:
+                self._recovery_dirty = True
                 raise
-            self.say(f"The workspace could not be saved for recovery: {exc}", "warning")
+            return
+
+        errors = self._save_errors
+
+        def save():
+            # Must not reference the controller: if this thread held its last reference, the
+            # controller (a QObject with timers) would be destroyed off the GUI thread and crash Qt.
+            try:
+                save_project(path, jobs)
+            except Exception as exc:
+                errors.append(exc)
+
+        self._save_future = self._saver.submit(save)
+
+    def _wait_for_save(self) -> None:
+        if self._save_future is not None:
+            self._save_future.result()
+            self._save_future = None
 
     def open_project(self, path: Path) -> None:
         if not self.can_edit():
@@ -567,7 +643,7 @@ class AppController(QObject):
             if self.project_path:
                 save_project(self.project_path, self.jobs)
             self._running_plan = plan
-            self.worker.start("mark", self.profile, plan)
+            self.worker.start("mark", self.profile, plan, self.device_choice)
         except Exception as exc:
             self._finish("interrupted")
             self.say(f"The job did not start: {exc}", "error")
@@ -608,7 +684,7 @@ class AppController(QObject):
             if job.board_id == top.board_id and job.side == "bottom" and job.placement == Placement():
                 self.jobs[index] = replace(job, placement=flipped_placement(top.placement))
                 self.verified.discard(job.job_id)
-                self.say("Top side complete. Flip the board, select the bottom side and register it on the holes "
+                self.say("Top side complete. Flip the board, select the bottom side and align it (frame, or register on holes or edge) "
                          "before running. Its position was pre-set from the top side as a starting point.", "success")
 
     def frame(self, continuous: bool = True) -> None:
@@ -621,7 +697,7 @@ class AppController(QObject):
         try:
             paths = compile_frame(self.frame_paths(), self.profile)
             self.arming.clear()
-            self.worker.start("frame-loop" if continuous else "frame", self.profile, paths)
+            self.worker.start("frame-loop" if continuous else "frame", self.profile, paths, self.device_choice)
         except Exception as exc:
             self.say(f"Framing did not start: {exc}", "error")
             return
@@ -716,6 +792,11 @@ class AppController(QObject):
     # ---- event pump
 
     def tick(self) -> None:
+        if self._save_errors:
+            error = self._save_errors.pop()
+            self._save_errors.clear()
+            self._recovery_dirty = True
+            self.say(f"The workspace could not be saved for recovery: {error}", "warning")
         self._pump_worker()
         self._pump_tasks()
         self._pump_detect()
@@ -727,6 +808,7 @@ class AppController(QObject):
                 self.stop()
                 self.say(f"Framing stopped: {exc}", "warning")
         snapshot = (tuple(self.blockers().items()), self.worker.action, self.link, self.link_note,
+                    tuple(device["key"] for device in self.usb_devices),
                     int(self.arming.remaining * 4), self.state_unknown)
         if snapshot != self._snapshot:
             self._snapshot = snapshot
@@ -828,7 +910,7 @@ class AppController(QObject):
     def _pump_detect(self) -> None:
         if self._detect is not None and self._detect.done():
             try:
-                link, note = self._detect.result()
+                link, note, self.usb_devices = self._detect.result()
             except Exception as exc:
                 link, note = "offline", str(exc)
             self._detect = None
@@ -851,7 +933,7 @@ class AppController(QObject):
         now = time.monotonic()
         if self._detect is None and not self.busy and now - self._last_detect > 2:
             self._last_detect = now
-            self._detect = self.executor.submit(probe_link)
+            self._detect = self.executor.submit(probe_link, self.device_choice)
         if self._driver_check is None and self.link in {"offline", "driver"} and now - self._last_driver > 12:
             self._last_driver = now
             self._driver_check = self.executor.submit(probe_driver)
@@ -867,5 +949,6 @@ class AppController(QObject):
             self.stop()
             return False
         self._timer.stop()
+        self._saver.shutdown(wait=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
         return True

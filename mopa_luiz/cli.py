@@ -14,13 +14,12 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_PROFILE = Path(os.environ.get(
-    "OPENLASER_PROFILE",
-    os.environ.get(
-        "OPENMOPA_PROFILE",
-        Path(__file__).resolve().parents[1] / "profiles" / "openmopa-machine.ini",
-    ),
-))
+DEFAULT_PROFILE = Path(
+    os.environ.get("STUDIOLASER_PROFILE")
+    or os.environ.get("OPENLASER_PROFILE")        # former name
+    or os.environ.get("OPENMOPA_PROFILE")
+    or Path(__file__).resolve().parents[1] / "profiles" / "openmopa-machine.ini"
+)
 
 JCZ_VENDOR_ID = 0x9588
 JCZ_PRODUCT_ID = 0x9899
@@ -140,16 +139,45 @@ def pyusb_probe() -> dict[str, Any]:
     return {
         "available": True,
         "libusb": libusb,
-        "devices": [
-            {
-                "idVendor": f"0x{dev.idVendor:04x}",
-                "idProduct": f"0x{dev.idProduct:04x}",
-                "bus": getattr(dev, "bus", None),
-                "address": getattr(dev, "address", None),
-            }
-            for dev in devices
-        ],
+        "devices": [describe_usb(dev) for dev in devices],
     }
+
+
+def usb_port(dev) -> str:
+    try:
+        numbers = dev.port_numbers
+    except Exception:
+        numbers = None
+    return ".".join(map(str, numbers)) if numbers else ""
+
+
+def describe_usb(dev) -> dict[str, Any]:
+    """A JCZ device as reported by libusb, with a key that survives power cycles.
+
+    The key is the bus and the physical port chain, so the same laser keeps its
+    key while it stays plugged into the same socket. Without port information
+    it falls back to the bus address, which changes when the device re-enumerates.
+    """
+    bus, port, address = getattr(dev, "bus", None), usb_port(dev), getattr(dev, "address", None)
+    return {
+        "idVendor": f"0x{dev.idVendor:04x}",
+        "idProduct": f"0x{dev.idProduct:04x}",
+        "bus": bus,
+        "address": address,
+        "port": port,
+        "key": f"{bus}-{port}" if port else f"{bus}:{address}",
+    }
+
+
+def usb_label(key: str) -> str:
+    """'1-3.2' -> 'USB bus 1, port 3.2'; '1:7' -> 'USB bus 1, device 7'."""
+    if "-" in key:
+        bus, port = key.split("-", 1)
+        return f"USB bus {bus}, port {port}"
+    if ":" in key:
+        bus, address = key.split(":", 1)
+        return f"USB bus {bus}, device {address}"
+    return key
 
 
 def os_usb_listing() -> tuple[str, int, list[str]]:
@@ -174,18 +202,18 @@ def detect_hint(seen_by_os: bool, usable: bool, libusb_ok: bool) -> str | None:
     if usable:
         return None
     if not libusb_ok:
-        return "The libusb library could not be loaded. Run the OpenLaser installer again."
+        return "The libusb library could not be loaded. Run the StudioLaser installer again."
     if not seen_by_os:
         return "No JCZ/LMC laser is visible. Check machine power and the USB cable, then run detect again."
     if sys.platform.startswith("win"):
         return (
-            "Windows sees the laser, but it is using the EZCAD (BJJCZ) driver, which OpenLaser "
+            "Windows sees the laser, but it is using the EZCAD (BJJCZ) driver, which StudioLaser "
             "cannot use. Install the WinUSB driver for USBLMCV4 with Zadig; see the README."
         )
     if sys.platform.startswith("linux"):
         return (
             "Linux sees the laser, but this user may not have permission to open it. Install "
-            "the udev rule from scripts/99-openlaser.rules; see the README."
+            "the udev rule from scripts/99-studiolaser.rules; see the README."
         )
     return "The laser is visible to the system but not to libusb. Reconnect USB and try again."
 
@@ -285,15 +313,15 @@ def export_pcb_svg(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="openlaser",
-        description="OpenLaser: safety-first jobs for JCZ/LMC galvo fiber lasers. "
+        prog="studiolaser",
+        description="StudioLaser: safety-first jobs for JCZ/LMC galvo fiber lasers. "
         "Without a command, the desktop workspace opens.",
     )
     parser.set_defaults(func=desktop_command)
     sub = parser.add_subparsers(dest="command")
     profile = {"dest": "profile", "metavar": "PROFILE", "type": Path, "default": DEFAULT_PROFILE}
 
-    p = sub.add_parser("desktop", help="Open the native OpenLaser workspace (the default).")
+    p = sub.add_parser("desktop", help="Open the native StudioLaser workspace (the default).")
     p.set_defaults(func=desktop_command)
 
     p = sub.add_parser("detect", help="Check local USB/runtime readiness without laser commands.")

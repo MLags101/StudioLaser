@@ -35,7 +35,7 @@ class JobParams:
 
 def connect_controller(
     cfg: MarkConfig, params: JobParams, connect_timeout_s: float = CONNECT_TIMEOUT_S,
-    *, field_size_mm: float | None = None, options: dict | None = None,
+    *, field_size_mm: float | None = None, options: dict | None = None, lock_name: str = "galvo",
 ) -> GalvoController:
     """Connect under a hard deadline; field size defaults to the profile's FIELDSIZE.
 
@@ -48,7 +48,7 @@ def connect_controller(
     field_size = field_size_mm if field_size_mm is not None else cfg.get_float("FIELDSIZE", 200.0) or 200.0
     usb_events: list[str] = []
     simulated = mock_mode()
-    lease = None if simulated else lock_galvo()
+    lease = None if simulated else lock_galvo(lock_name)
     settings = {
         "power": params.power,
         "frequency": params.frequency_khz,
@@ -115,7 +115,7 @@ def connect_controller(
         elif any(marker in log_text for marker in ("access denied", "errno 13", "permission")):
             hint = (
                 "This user is not allowed to open the laser's USB device. On Linux, install "
-                "scripts/99-openlaser.rules (see the README), then unplug and replug the laser."
+                "scripts/99-studiolaser.rules (see the README), then unplug and replug the laser."
             )
         else:
             hint = "Check power, USB cable, and the Detect panel, then retry."

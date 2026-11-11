@@ -1,6 +1,6 @@
 # Security and Safety
 
-OpenLaser controls hardware that can emit laser radiation. Treat this project as experimental software and use it only with appropriate laser safety controls, enclosure, interlocks, eyewear, ventilation, and trained operators.
+StudioLaser controls hardware that can emit laser radiation. Treat this project as experimental software and use it only with appropriate laser safety controls, enclosure, interlocks, eyewear, ventilation, and trained operators.
 
 ## Sensitive files not meant for git
 

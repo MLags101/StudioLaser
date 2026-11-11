@@ -179,3 +179,19 @@ def test_red_light_save_never_interrupts_an_engraving(app, tmp_path, monkeypatch
         dialog.close()
     finally:
         c.shutdown()
+
+
+def test_settings_from_the_former_name_are_carried_over(tmp_path, monkeypatch):
+    from mopa_luiz.gui.controller import state_directory
+
+    former = tmp_path / "OpenLaser"
+    former.mkdir()
+    (former / "active-machine.json").write_text("{}", encoding="utf-8")
+    (former / "galvo.lock").write_text("", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    current = state_directory()
+    assert current == tmp_path / "StudioLaser"
+    assert (current / "active-machine.json").is_file() and not (current / "galvo.lock").exists()
+    (current / "active-machine.json").write_text('{"kept": true}', encoding="utf-8")
+    state_directory()                                 # never copied twice over newer settings
+    assert "kept" in (current / "active-machine.json").read_text(encoding="utf-8")

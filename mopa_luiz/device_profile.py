@@ -258,7 +258,7 @@ def import_ezcad(config: Path, correction: Path | None = None, *,
         base = "ezcad"
         notes.append(
             "EZCAD had the correction file switched off (ENABLECORFILE=0) and was correcting the lens with its "
-            f"field parameters (bulge {ezcad.bulge_x:g} / {ezcad.bulge_y:g}). OpenLaser approximates those "
+            f"field parameters (bulge {ezcad.bulge_x:g} / {ezcad.bulge_y:g}). StudioLaser approximates those "
             "parameters; EZCAD's exact formula is not published. Run Calibrate Lens and measure before trusting sizes."
         )
         if cor_text:

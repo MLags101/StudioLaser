@@ -1,6 +1,6 @@
-# Commissioning OpenLaser on a ComMarker B6 MOPA
+# Commissioning StudioLaser on a ComMarker B6 MOPA
 
-OpenLaser has been exercised against a simulated controller and automated
+StudioLaser has been exercised against a simulated controller and automated
 tests only. This checklist covers what has to be confirmed on the real machine,
 in order. Stop at the first step that fails and report it.
 
@@ -10,7 +10,7 @@ fume extraction, and keep the machine's own emergency stop within reach.
 ## 1. Connection
 
 - [ ] Install the WinUSB driver with Zadig (README → USB driver).
-- [ ] Start OpenLaser. The chip at the top right reads **Laser connected**.
+- [ ] Start StudioLaser. The chip at the top right reads **Laser connected**.
 - [ ] Unplug USB: the chip changes to **Laser offline** within a few seconds.
 - [ ] With EZCAD's driver installed instead, the chip reads **Wrong USB driver**.
       If it reads *Laser connected* and framing then fails, note the error text:

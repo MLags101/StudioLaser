@@ -108,7 +108,28 @@ def lights_out(controller):
     controller.write_port()
 
 
-def hardware_operation(pipe, action, profile, payload, ready):
+def resolve_device(choice: str) -> tuple[int, str]:
+    """galvoplotter opens "device number N" in libusb's order; turn the operator's choice into N.
+
+    Refuses rather than guessing: if the chosen laser is gone, the other one must not be opened.
+    """
+    from .cli import usb_label
+
+    devices = pyusb_probe()["devices"]
+    if choice:
+        for index, device in enumerate(devices):
+            if device["key"] == choice:
+                return index, choice
+        raise ConnectionError(f"The selected laser ({usb_label(choice)}) is not connected. Plug it in, or choose "
+                              "another laser in the menu at the top right.")
+    if len(devices) == 1:
+        return 0, devices[0]["key"]
+    if not devices:
+        raise ConnectionError("No JCZ/LMC laser is connected")
+    raise ConnectionError("More than one laser is connected. Choose which one to use in the menu at the top right.")
+
+
+def hardware_operation(pipe, action, profile, payload, ready, device=""):
     stop = threading.Event()
     frame = [payload]
     pending_frame = threading.Event()
@@ -141,11 +162,10 @@ def hardware_operation(pipe, action, profile, payload, ready):
         listener = threading.Thread(target=listen, daemon=True)
         listener.start()
         profile.validate(live=True)
-        if not mock_mode() and len(pyusb_probe()["devices"]) != 1:
-            raise ConnectionError("Connect exactly one JCZ/LMC galvo before operating it")
+        machine_index, device_key = (0, "simulated") if mock_mode() else resolve_device(device)
         params = JobParams("", 0, profile.min_hz / 1000, profile.pulse_widths[0], 10, 1000)
         original_send = None
-        with TemporaryDirectory(prefix="openlaser-") as directory:
+        with TemporaryDirectory(prefix="studiolaser-") as directory:
             # Only a factory .cor goes to the board. Other bases upload a blank
             # table and correct in software (DeviceProfile.galvo_point).
             correction = None
@@ -160,7 +180,9 @@ def hardware_operation(pipe, action, profile, payload, ready):
                     with redirect_stdout(sink) if simulated else nullcontext():
                         controller = connect_controller(
                             profile.config(), params, CONNECT_SECONDS, field_size_mm=profile.width,
-                            options={"cor_file": str(correction) if correction else None,
+                            lock_name=f"galvo-{device_key}",
+                            options={"machine_index": machine_index,
+                                     "cor_file": str(correction) if correction else None,
                                      "light_speed": profile.frame_speed, "travel_speed": profile.jump_speed,
                                      "galvos_per_mm": profile.units_per_mm, **profile.delays},
                         )
@@ -246,14 +268,14 @@ class HardwareWorker:
         self._batch_timeouts = ()
         self._saw_result = False
 
-    def start(self, action, profile=None, payload=None):
+    def start(self, action, profile=None, payload=None, device=""):
         if self.process is not None:
             raise RuntimeError("Wait for the current galvo operation to finish")
         context = mp.get_context("spawn")
         child_commands, self.commands = context.Pipe(duplex=False)
         self.results, child_results = context.Pipe(duplex=False)
         process = context.Process(
-            target=hardware_operation, args=(child_commands, action, profile, payload, child_results),
+            target=hardware_operation, args=(child_commands, action, profile, payload, child_results, device),
         )
         try:
             process.start()

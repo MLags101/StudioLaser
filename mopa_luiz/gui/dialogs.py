@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from ..patterns import PARAMETERS, focus_test, hole_targets, kerf_ladder, steps, test_matrix
 from ..presets import Preset, layer_summary, starting_layer
-from ..workspace import COPPER_CONTOUR, COPPER_FILL, KIND_LABELS, KINDS, fit_placement
+from ..workspace import COPPER_CONTOUR, COPPER_FILL, KIND_LABELS, KINDS, fit_placement, fit_to_outline
 from .panels import button, heading, hint, number, row, whole
 
 ROLE_LABELS = {
@@ -38,7 +38,7 @@ class PcbImportDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(hint(
             "Export every layer at 1:1 from the same origin the CNC used, unmirrored. "
-            "OpenLaser mirrors the bottom side itself."))
+            "StudioLaser mirrors the bottom side itself."))
         self.table = QTableWidget(len(paths), 2)
         self.table.setHorizontalHeaderLabels(["File", "Use as"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -162,9 +162,9 @@ class PcbImportDialog(QDialog):
 
 
 class RegistrationDialog(QDialog):
-    """Fit the board's position from two or more drilled holes found with the red light.
+    """Fit the board's position from drilled holes or from its edges, found with the red light.
 
-    A tool window, not a modal one: the canvas stays live so holes are chosen
+    A tool window, not a modal one: the canvas stays live so points are chosen
     by clicking them, and Stop stays reachable.
     """
 
@@ -172,24 +172,31 @@ class RegistrationDialog(QDialog):
 
     def __init__(self, controller, canvas, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Register board on holes")
+        self.setWindowTitle("Register board")
         self.setWindowFlag(Qt.WindowType.Tool, True)
         self.setModal(False)
-        self.resize(430, 560)
+        self.resize(450, 600)
         self.controller = controller
         self.canvas = canvas
-        self.job_id = controller.job.job_id
-        self.points: list[tuple[int, list[float]]] = []    # (reference index, machine [x, y])
+        job = controller.job
+        self.job_id = job.job_id
+        self.start = job.placement
+        # Each point: [hole index or None, design point, machine point [x, y]].
+        self.points: list[list] = []
         self.active = -1
         self.result = None
         layout = QVBoxLayout(self)
-        what = "drilled hole" if controller.job.holes else "board corner"
-        layout.addWidget(hint(
-            f"1. Click a {what} on the canvas (yellow markers).\n"
-            f"2. Steer the red dot onto that {what} on the real board.\n"
-            f"3. Repeat for a second {what} far from the first. A third or fourth checks the fit."))
+        self.mode = QComboBox()
+        if job.references:
+            self.mode.addItem("Drilled holes" if job.holes else "Board corners", "holes")
+        if job.boundary:
+            self.mode.addItem("Board edge (edge cuts)", "edge")
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        layout.addLayout(row(QLabel("Register on"), self.mode, stretch=True))
+        self.instructions = hint()
+        layout.addWidget(self.instructions)
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Hole", "Machine X", "Machine Y", "Error"])
+        self.table.setHorizontalHeaderLabels(["Point", "Machine X", "Machine Y", "Error"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().hide()
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -206,6 +213,8 @@ class RegistrationDialog(QDialog):
         for text, dx, dy, r, c in (("▲", 0, 1, 0, 1), ("◀", -1, 0, 1, 0), ("▶", 1, 0, 1, 2), ("▼", 0, -1, 2, 1)):
             arrow = button(text, lambda _=False, dx=dx, dy=dy: self.jog(dx, dy))
             arrow.setFixedSize(46, 34)
+            arrow.setAutoRepeat(True)
+            arrow.setStyleSheet("font-size: 14pt; padding: 0;")
             pad.addWidget(arrow, r, c)
         pad_box = QHBoxLayout()
         pad_box.addLayout(pad)
@@ -219,42 +228,82 @@ class RegistrationDialog(QDialog):
         pad_box.addLayout(side, 1)
         layout.addLayout(pad_box)
 
-        self.summary = QLabel("Choose two holes to begin.")
+        self.summary = QLabel()
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
-        self.remove = button("Remove hole", self.remove_point)
-        self.check = button("Show all holes with red light", self.show_holes,
-                            tip="Draws a red circle around every chosen hole at the fitted position")
+        self.remove = button("Remove point", self.remove_point)
+        self.check = button("Check with red light", self.show_check,
+                            tip="Traces the fitted result with the red light: rings at the holes, or the board outline")
         self.apply = button("Apply registration", self.accept, primary=True)
         layout.addLayout(row(self.remove, self.check))
         layout.addLayout(row(button("Cancel", self.reject), self.apply))
 
         canvas.picking = True
-        canvas.picked = []
-        canvas.reference_picked.connect(self.add_point)
+        canvas.marks = []
+        canvas.reference_picked.connect(self.add_hole)
+        canvas.edge_picked.connect(self.add_edge)
         controller.selection_changed.connect(self.reject)
         controller.state_changed.connect(self._light_state)
-        self._refit()
+        self._mode_changed()
         self._light_state()
+
+    @property
+    def edge_mode(self) -> bool:
+        return self.mode.currentData() == "edge"
+
+    def _mode_changed(self):
+        self.points.clear()
+        self.active = -1
+        self.canvas.pick_mode = self.mode.currentData()
+        if self.edge_mode:
+            self.instructions.setText(
+                "1. Frame first so the outline is roughly on the board.\n"
+                "2. Click a point on the board outline (edge cuts) on the canvas.\n"
+                "3. Steer the red dot onto that edge of the real board. Any spot along the edge will do.\n"
+                "4. Add points on at least two different edges, three or more in total. Corners and opposite "
+                "edges give the best fit.")
+        else:
+            what = "drilled hole" if self.controller.job.holes else "board corner"
+            self.instructions.setText(
+                f"1. Click a {what} on the canvas (yellow markers).\n"
+                f"2. Steer the red dot onto that {what} on the real board.\n"
+                f"3. Repeat for a second {what} far from the first. A third or fourth checks the fit.")
+        self.controller.clear_target()
+        self._fill()
 
     def _light_state(self):
         reason = self.controller.blockers()["frame"] if not self.controller.framing else ""
         self.light.setText(f"Red light is off: {reason}. You can still type positions measured another way."
                            if reason else "")
 
-    def add_point(self, index: int):
+    def _current_job(self):
         job = self.controller.job
-        if job is None or job.job_id != self.job_id:
+        return job if job is not None and job.job_id == self.job_id else None
+
+    def add_hole(self, index: int):
+        job = self._current_job()
+        if job is None or self.edge_mode:
             return
-        existing = next((row for row, (ref, _) in enumerate(self.points) if ref == index), None)
+        existing = next((r for r, point in enumerate(self.points) if point[0] == index), None)
         if existing is None:
             if len(self.points) >= 6:
                 return
-            self.points.append((index, list(job.placement.apply(job.references[index]))))
+            design = job.references[index]
+            self.points.append([index, design, list(job.placement.apply(design))])
             existing = len(self.points) - 1
+        self._select(existing)
+
+    def add_edge(self, x: float, y: float):
+        job = self._current_job()
+        if job is None or not self.edge_mode or len(self.points) >= 8:
+            return
+        self.points.append([None, (x, y), list(job.placement.apply((x, y)))])
+        self._select(len(self.points) - 1)
+
+    def _select(self, row_index):
+        self.active = row_index
         self._fill()
-        self.table.selectRow(existing)
-        self._activate(existing)
+        self._activate(row_index)
 
     def remove_point(self):
         if 0 <= self.active < len(self.points):
@@ -269,13 +318,13 @@ class RegistrationDialog(QDialog):
             self.controller.clear_target()
             return
         self.active = row_index
-        self.controller.show_point(tuple(self.points[row_index][1]))
+        self.controller.show_point(tuple(self.points[row_index][2]))
 
     def jog(self, dx: float, dy: float):
         if not 0 <= self.active < len(self.points):
             return
         step = self.step.currentData()
-        point = self.points[self.active][1]
+        point = self.points[self.active][2]
         half_w, half_h = self.controller.profile.width / 2, self.controller.profile.height / 2
         point[0] = round(max(-half_w, min(half_w, point[0] + dx * step)), 3)
         point[1] = round(max(-half_h, min(half_h, point[1] + dy * step)), 3)
@@ -293,60 +342,80 @@ class RegistrationDialog(QDialog):
         self._refit()
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.points))
-        for row_index, (ref, (x, y)) in enumerate(self.points):
+        label = "Edge" if self.edge_mode else "Hole" if self.controller.job.holes else "Corner"
+        for row_index, (_, _, (x, y)) in enumerate(self.points):
             error = ""
             if self.result and row_index < len(self.result.residuals):
                 error = f"{self.result.residuals[row_index] * 1000:.0f} µm"
-            for column, text in enumerate((f"#{row_index + 1}", f"{x:.3f}", f"{y:.3f}", error)):
+            for column, text in enumerate((f"{label} {row_index + 1}", f"{x:.3f}", f"{y:.3f}", error)):
                 self.table.setItem(row_index, column, QTableWidgetItem(text))
         if 0 <= self.active < len(self.points):
             self.table.selectRow(self.active)
         self.table.blockSignals(False)
-        self.canvas.picked = [ref for ref, _ in self.points]
+        job = self._current_job()
+        self.canvas.marks = [job.placement.apply(design) for _, design, _ in self.points] if job else []
         self.canvas.viewport().update()
 
     def _refit(self):
-        job = self.controller.job
+        job = self._current_job()
         self.result = None
-        text = "Choose two holes to begin." if len(self.points) < 2 else ""
-        if job is not None and len(self.points) >= 2:
+        need = 3 if self.edge_mode else 2
+        text = f"Add {need - len(self.points)} more point(s) to fit." if len(self.points) < need else ""
+        if job is not None and len(self.points) >= need:
+            measured = [tuple(machine) for _, _, machine in self.points]
             try:
-                self.result = fit_placement([job.references[ref] for ref, _ in self.points],
-                                            [tuple(machine) for _, machine in self.points])
+                if self.edge_mode:
+                    self.result = fit_to_outline(job.boundary, measured, self.start,
+                                                 picked=[design for _, design, _ in self.points])
+                else:
+                    self.result = fit_placement([design for _, design, _ in self.points], measured)
             except ValueError as exc:
                 text = str(exc)
             else:
-                worst, spacing = self.result.worst, self.result.spacing_error
-                p = self.result.placement
-                text = (f"Fitted position X {p.x:.3f}, Y {p.y:.3f} mm, rotation {p.angle:.3f}°.\n"
-                        f"Hole spacing differs from the design by {spacing * 1000:.0f} µm"
-                        + (f"; worst hole is {worst * 1000:.0f} µm off the fit." if len(self.points) > 2 else "."))
-                if max(worst, spacing) > self.TOLERANCE:
-                    text += ("\n⚠ That is more than expected. Check you picked the right holes, the board is "
-                             "the right way up, and the lens is calibrated.")
+                p, worst = self.result.placement, self.result.worst
+                text = f"Fitted position X {p.x:.3f}, Y {p.y:.3f} mm, rotation {p.angle:.3f}°.\n"
+                if self.edge_mode:
+                    text += f"Worst point is {worst * 1000:.0f} µm from the board edge."
+                    if not self.result.well_posed:
+                        self.result = None
+                        text += ("\n⚠ These points cannot fix both position and rotation (for example, all on one "
+                                 "straight edge). Add a point on a neighbouring edge.")
+                else:
+                    spacing = self.result.spacing_error
+                    text += (f"Hole spacing differs from the design by {spacing * 1000:.0f} µm"
+                             + (f"; worst hole is {worst * 1000:.0f} µm off the fit." if len(self.points) > 2 else "."))
+                    worst = max(worst, spacing)
+                if self.result is not None and worst > self.TOLERANCE:
+                    text += ("\n⚠ That is more than expected. Check the points, that the board is the right way "
+                             "up, and that the lens is calibrated.")
         self.summary.setText(text)
         self.apply.setEnabled(self.result is not None)
         self.check.setEnabled(self.result is not None)
         self.remove.setEnabled(bool(self.points))
 
-    def show_holes(self):
-        job = self.controller.job
-        if self.result and job:
-            placed = [self.result.placement.apply(job.references[ref]) for ref, _ in self.points]
+    def show_check(self):
+        job = self._current_job()
+        if not (self.result and job):
+            return
+        if self.edge_mode:
+            self.controller.show_target(self.result.placement.paths(job.boundary))
+        else:
+            placed = [self.result.placement.apply(design) for _, design, _ in self.points]
             self.controller.show_target(hole_targets(placed, radius=0.8))
 
     def done(self, code):
         self.canvas.picking = False
-        self.canvas.picked = []
+        self.canvas.marks = []
         try:
-            self.canvas.reference_picked.disconnect(self.add_point)
+            self.canvas.reference_picked.disconnect(self.add_hole)
+            self.canvas.edge_picked.disconnect(self.add_edge)
             self.controller.selection_changed.disconnect(self.reject)
             self.controller.state_changed.disconnect(self._light_state)
         except (RuntimeError, TypeError):
             pass
         self.controller.clear_target()
-        job = self.controller.job
-        if code == QDialog.DialogCode.Accepted and self.result and job and job.job_id == self.job_id:
+        job = self._current_job()
+        if code == QDialog.DialogCode.Accepted and self.result and job:
             self.controller.set_placement(self.result.placement, merge="")
             self.controller.say(self.summary.text().splitlines()[0] + " Check the frame, then tick the alignment box.",
                                 "success")
@@ -512,14 +581,14 @@ class PresetManagerDialog(QDialog):
             self._change(lambda: self.controller.presets.remove(preset.preset_id))
 
     def import_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import presets", filter="OpenLaser presets (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Import presets", filter="StudioLaser presets (*.json)")
         if path:
             self._change(lambda: self.controller.say(
                 f"Imported {self.controller.presets.import_file(Path(path))} preset(s).", "success"))
 
     def export(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export presets", "openlaser-presets.json",
-                                              "OpenLaser presets (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export presets", "studiolaser-presets.json",
+                                              "StudioLaser presets (*.json)")
         if path:
             self._change(lambda: self.controller.presets.export(Path(path)))
 

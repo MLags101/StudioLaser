@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# OpenLaser installer for Linux.
+# StudioLaser installer for Linux.
 #
-# Run it from a terminal inside the OpenLaser folder:
-#     bash install-openlaser.sh
+# Run it from a terminal inside the StudioLaser folder:
+#     bash install-studiolaser.sh
 # It:
 #   1. finds Python 3.10 or newer,
-#   2. sets up OpenLaser's private Python environment (.venv) and its dependencies,
-#   3. adds OpenLaser to your applications menu,
+#   2. sets up StudioLaser's private Python environment (.venv) and its dependencies,
+#   3. adds StudioLaser to your applications menu,
 #   4. offers to install the USB permission rule for the JCZ/LMC MOPA laser.
 #
 # Safe to run again at any time (after moving this folder, or to update).
@@ -18,7 +18,7 @@ PROJECT_DIR="$(pwd)"
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[1;31m%s\033[0m\n%s\n' "$1" "${2:-}"; exit 1; }
 
-printf '\n\033[1mOpenLaser installer\033[0m\n'
+printf '\n\033[1mStudioLaser installer\033[0m\n'
 printf 'Installing into: %s\n' "$PROJECT_DIR"
 
 step "Step 1 of 4: Looking for Python 3.10 or newer"
@@ -46,7 +46,7 @@ if ! "$PYTHON" -c 'import venv, ensurepip' >/dev/null 2>&1; then
 then run this installer again."
 fi
 
-step "Step 2 of 4: Installing OpenLaser (this can take a minute)"
+step "Step 2 of 4: Installing StudioLaser (this can take a minute)"
 if [ ! -x ".venv/bin/python" ]; then
   "$PYTHON" -m venv .venv
 fi
@@ -55,38 +55,38 @@ fi
   || fail "The installation step failed." \
 "Check your internet connection and run this installer again.
 If it keeps failing, please open an issue at
-https://github.com/luizbueno3d/OpenLaser/issues with the text above."
+https://github.com/MLags101/StudioLaser/issues with the text above."
 
-step "Step 3 of 4: Adding OpenLaser to your applications menu"
+step "Step 3 of 4: Adding StudioLaser to your applications menu"
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 mkdir -p "$APPS_DIR"
-cat > "$APPS_DIR/openlaser.desktop" <<EOF
+cat > "$APPS_DIR/studiolaser.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=OpenLaser
+Name=StudioLaser
 Comment=Prepare and run laser and plotter jobs
-Exec="$PROJECT_DIR/.venv/bin/openlaser-desktop"
+Exec="$PROJECT_DIR/.venv/bin/studiolaser-desktop"
 Path=$PROJECT_DIR
 Icon=$PROJECT_DIR/assets/icons/openmopa-256.png
 Terminal=false
 Categories=Graphics;Engineering;
 EOF
-chmod +x "$APPS_DIR/openlaser.desktop"
+chmod +x "$APPS_DIR/studiolaser.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
-echo "Added: $APPS_DIR/openlaser.desktop"
+echo "Added: $APPS_DIR/studiolaser.desktop"
 
 step "Step 4 of 4: USB permission for the JCZ/LMC MOPA laser"
-RULE_TARGET=/etc/udev/rules.d/99-openlaser.rules
-if [ -f "$RULE_TARGET" ] && cmp -s scripts/99-openlaser.rules "$RULE_TARGET"; then
+RULE_TARGET=/etc/udev/rules.d/99-studiolaser.rules
+if [ -f "$RULE_TARGET" ] && cmp -s scripts/99-studiolaser.rules "$RULE_TARGET"; then
   echo "The USB permission rule is already installed."
-elif [ "${OPENLASER_SKIP_UDEV:-0}" = "1" ] || [ ! -t 0 ]; then
+elif [ "${STUDIOLASER_SKIP_UDEV:-0}" = "1" ] || [ ! -t 0 ]; then
   echo "Skipped. If you use a JCZ/LMC MOPA laser, install the rule later with:"
-  echo "  sudo cp scripts/99-openlaser.rules $RULE_TARGET && sudo udevadm control --reload-rules && sudo udevadm trigger"
+  echo "  sudo cp scripts/99-studiolaser.rules $RULE_TARGET && sudo udevadm control --reload-rules && sudo udevadm trigger"
 else
   echo "Only needed for the JCZ/LMC MOPA laser (GRBL machines do not need it)."
   read -r -p "Install the USB permission rule now? It asks for your password. [Y/n] " answer
   if [[ ! "$answer" =~ ^[Nn] ]]; then
-    sudo cp scripts/99-openlaser.rules "$RULE_TARGET"
+    sudo cp scripts/99-studiolaser.rules "$RULE_TARGET"
     sudo udevadm control --reload-rules
     sudo udevadm trigger
     echo "Installed. Unplug and replug the laser's USB cable once."
@@ -95,14 +95,14 @@ else
   fi
 fi
 
-printf '\n\033[1;32mDone! OpenLaser is installed.\033[0m\n'
+printf '\n\033[1;32mDone! StudioLaser is installed.\033[0m\n'
 cat <<'EOF'
 
-  * Open your applications menu and start "OpenLaser".
-    The OpenLaser desktop workspace opens.
-  * Tip: right-click OpenLaser in the menu or dock and choose
+  * Open your applications menu and start "StudioLaser".
+    The StudioLaser desktop workspace opens.
+  * Tip: right-click StudioLaser in the menu or dock and choose
     "Add to Favorites" / "Pin" for one-click launching.
-  * To quit OpenLaser, close its window.
+  * To quit StudioLaser, close its window.
   * If you move this folder somewhere else later, run this installer again.
 
 EOF

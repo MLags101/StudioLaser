@@ -33,7 +33,7 @@ a.binaries = [
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, a.binaries, a.datas,
-    name="OpenLaser",
+    name="StudioLaser",
     icon=str(icon),
     console=False,
     upx=False,

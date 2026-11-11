@@ -1,1 +1,1 @@
-"""OpenLaser desktop interface (PySide6)."""
+"""StudioLaser desktop interface (PySide6)."""

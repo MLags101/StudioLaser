@@ -314,7 +314,7 @@ class MachineSetupDialog(QDialog):
                             output=True)
             try:
                 library.add(Preset("", name, kind, layer, profile.name, profile.lens, profile.source,
-                                   note="Imported from EZCAD's MarkParam.lib. Hatch spacing is OpenLaser's default: "
+                                   note="Imported from EZCAD's MarkParam.lib. Hatch spacing is StudioLaser's default: "
                                         "EZCAD keeps it on each drawing object, not in the pen library."))
             except Exception as exc:
                 self.controller.say(f"EZCAD set {pen.name} was not added: {exc}", "warning")
@@ -326,7 +326,7 @@ class MachineSetupDialog(QDialog):
         return added
 
     def open_profile(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open machine profile", filter="OpenLaser machine (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open machine profile", filter="StudioLaser machine (*.json)")
         if path:
             try:
                 self.load(DeviceProfile.open(Path(path)))
@@ -335,8 +335,8 @@ class MachineSetupDialog(QDialog):
                 QMessageBox.warning(self, "Machine profile", str(exc))
 
     def save_profile_as(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save machine profile", "commarker-b6.openlaser-machine.json",
-                                              "OpenLaser machine (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save machine profile", "commarker-b6.studiolaser-machine.json",
+                                              "StudioLaser machine (*.json)")
         if path:
             try:
                 self.collect().save(Path(path))

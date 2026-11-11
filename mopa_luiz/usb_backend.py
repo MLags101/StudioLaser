@@ -51,7 +51,7 @@ def ensure_libusb_backend() -> dict[str, Any]:
         _STATUS = {
             "available": False,
             "source": None,
-            "note": "No libusb-1.0 library found. Run the OpenLaser installer again "
+            "note": "No libusb-1.0 library found. Run the StudioLaser installer again "
                     "so the libusb-package dependency is installed.",
         }
     else:

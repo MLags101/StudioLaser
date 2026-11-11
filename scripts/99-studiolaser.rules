@@ -1,3 +1,3 @@
 # Let normal (non-root) users open the JCZ/BJJCZ LMC galvo controller (USBLMCV4).
-# Installed by install-openlaser.sh to /etc/udev/rules.d/99-openlaser.rules.
+# Installed by install-studiolaser.sh to /etc/udev/rules.d/99-studiolaser.rules.
 SUBSYSTEM=="usb", ATTRS{idVendor}=="9588", ATTRS{idProduct}=="9899", MODE="0666", TAG+="uaccess"

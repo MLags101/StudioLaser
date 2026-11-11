@@ -1,6 +1,6 @@
 # Reference material
 
-Files collected in this folder, and where the numbers in OpenLaser come from.
+Files collected in this folder, and where the numbers in StudioLaser come from.
 None of the laser parameters below were measured on the target machine.
 
 ## Files here
@@ -33,7 +33,7 @@ several were scaled from 20 W non-MOPA machines. Tune them with a test matrix.
   `JCZ_COR_2_1` variant (36-byte header, 65 × 65 int32 pairs, short trailer) was
   read from the machine's own `jcz15.cor`.
 - EZCAD's parametric correction (scale, bulge, skew, trapezoid) has no published
-  formula. OpenLaser's version is an approximation.
+  formula. StudioLaser's version is an approximation.
 - Calibration procedure modelled on LightBurn's galvo lens calibration:
   https://docs.lightburnsoftware.com/2.1/Reference/CalibrateGalvoLens/ and
   https://docs.lightburnsoftware.com/2.1/Reference/DeviceSettings/GalvoBasicSettings/

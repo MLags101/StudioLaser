@@ -1,10 +1,10 @@
-# OpenLaser implementation and handoff notes
+# StudioLaser implementation and handoff notes
 
 ## Update, 11 November 2026: overhaul
 
 This section supersedes anything below that conflicts with it.
 
-**Removed.** The browser interface (`openlaser ui`, `ui.py`), G-code export, GRBL machine profiles and their tests. The browser path let any web page start a mark, and its Stop on Windows killed the worker without aborting the controller. The desktop app is the only interface; bare `openlaser` starts it.
+**Removed.** The browser interface (`studiolaser ui`, `ui.py`), G-code export, GRBL machine profiles and their tests. The browser path let any web page start a mark, and its Stop on Windows killed the worker without aborting the controller. The desktop app is the only interface; bare `studiolaser` starts it.
 
 **New layout.**
 
@@ -49,26 +49,39 @@ This section supersedes anything below that conflicts with it.
 - The factory files (`markcfg7`, `jcz15.cor`, `MarkParam.lib`) and the reference manuals are committed, with the
   owner's agreement.
 
+**Third pass.**
+- Renamed to **StudioLaser** (commands `studiolaser`, `studiolaser-desktop`; `openlaser`, `openlaser-desktop` and
+  `openmopa` remain as aliases). The settings folder moves to `%LOCALAPPDATA%\StudioLaser`, copied once from
+  `OpenLaser`; window settings are copied the same way; `.openlaser.json` projects still open. The Python package
+  is still `mopa_luiz`.
+- Fixed a crash when ticking an operation in the job tree (the tree rebuilt itself inside the tick-box signal).
+  Panels and the canvas now rebuild after the event that asked for it. Bounds use a cached convex hull, recovery
+  saves run on a background thread, and the grid draws in one call.
+- Registration can fit to the board edge (edge cuts): each point is fitted only to the edge it was picked on,
+  by Gauss-Newton on point-to-edge distance, and under-determined point sets are refused.
+- The connection chip is a laser picker, keyed by USB bus and port; an unplugged choice is refused, never
+  substituted.
+
 **Not done.** Per-file preview in the PCB import dialog, snapping to drill centres while dragging, a saved fixture origin for a corner jig, native KiCad board import.
 
 **Verification.** `python -m pytest tests -q`: 147 pass in a venv built with `pip install -e ".[desktop,freeze,dev]"`; `test_bundled_libusb_is_used_when_the_system_has_none` fails only where the `libusb-package` wheel is not installed. The app was driven end to end against the simulated controller (`OPENMOPA_MOCK=1`): import, preview, arm, start, completion, back-side gate, live frame updates, Stop. **Nothing has been run on the laser.** Use [docs/commissioning.md](docs/commissioning.md).
 
 ## State before the overhaul
 
-OpenLaser now has a Windows-first PySide6 desktop workspace for the makerspace’s ComMarker B6 MOPA and its CNC-first, double-sided PCB workflow. The CNC cuts the board profile, holes, and slots. The B6 directly removes copper from each side after the operator transfers and aligns the board. (The browser entry point mentioned in earlier versions of these notes has since been removed.)
+StudioLaser now has a Windows-first PySide6 desktop workspace for the makerspace’s ComMarker B6 MOPA and its CNC-first, double-sided PCB workflow. The CNC cuts the board profile, holes, and slots. The B6 directly removes copper from each side after the operator transfers and aligns the board. (The browser entry point mentioned in earlier versions of these notes has since been removed.)
 
-The standalone build is [OpenLaser.exe](dist/OpenLaser.exe), 75 MB, for x64 Windows 11 or Windows 10 version 1809 or later. It bundles Python, Qt, the Gerber/Excellon converter, and libusb. Copy the executable to the destination PC and double-click it. The target PC needs the JCZ/LMC WinUSB driver to communicate with the laser. The executable was built locally and is in the ignored `dist` directory.
+The standalone build is [StudioLaser.exe](dist/StudioLaser.exe), 75 MB, for x64 Windows 11 or Windows 10 version 1809 or later. It bundles Python, Qt, the Gerber/Excellon converter, and libusb. Copy the executable to the destination PC and double-click it. The target PC needs the JCZ/LMC WinUSB driver to communicate with the laser. The executable was built locally and is in the ignored `dist` directory.
 
 ## Saving and moving to another PC
 
-- Save named projects as `.openlaser.json` files in any writable location. A project stores its queue, artwork, PCB sides, placements, job status, and snapshots of operation settings.
-- The desktop app keeps per-user settings in `%LOCALAPPDATA%\OpenLaser`. The active machine and lens profile is `active-machine.json`, the named preset library is `recipes.json`, and the recovered workspace is `recovery.json`.
-- To migrate the setup, close OpenLaser, copy the settings folder to the matching location on the destination PC, and copy any named projects saved elsewhere. **Machine → Save Lens Profile As** exports an individual profile, including its imported lens correction. Use **Machine → Open Lens Profile** on the destination PC to activate it.
+- Save named projects as `.studiolaser.json` files in any writable location. A project stores its queue, artwork, PCB sides, placements, job status, and snapshots of operation settings.
+- The desktop app keeps per-user settings in `%LOCALAPPDATA%\StudioLaser`. The active machine and lens profile is `active-machine.json`, the named preset library is `recipes.json`, and the recovered workspace is `recovery.json`.
+- To migrate the setup, close StudioLaser, copy the settings folder to the matching location on the destination PC, and copy any named projects saved elsewhere. **Machine → Save Lens Profile As** exports an individual profile, including its imported lens correction. Use **Machine → Open Lens Profile** on the destination PC to activate it.
 - On reopening a project, a job that was saved as running is treated as interrupted. Recheck the physical board placement before a fresh run.
 
 ## Makerspace PCB workflow
 
-1. Export front copper, back copper, the board outline, and Excellon drill and slot files at 1:1 from the same fabrication origin used for the CNC. Use the unmirrored copper exports. OpenLaser applies the bottom reflection using the board center and the selected physical flip axis.
+1. Export front copper, back copper, the board outline, and Excellon drill and slot files at 1:1 from the same fabrication origin used for the CNC. Use the unmirrored copper exports. StudioLaser applies the bottom reflection using the board center and the selected physical flip axis.
 2. Use **Import PCB Board** to map the files and choose **Isolation channels** or **Full Clear**. The preview shows retained copper, copper removal, and drill references. Outline cutouts, holes, and slots are excluded from removal geometry.
 3. Put the CNC-cut board on the B6. Use **Continuous Frame** to align the artwork with the stock. Drag, enter exact X/Y/rotation, or use the arrow keys. Ctrl+arrow rotates, and Shift selects a finer step.
 4. Use **Register Board** to fit two ordered CNC hole centers or two points on a straight board edge. Registration fits translation and rotation at fixed scale. The spacing mismatch and optional third-point check help detect a wrong reference or flip.
@@ -80,9 +93,9 @@ The standalone build is [OpenLaser.exe](dist/OpenLaser.exe), 75 MB, for x64 Wind
 - SVG artwork imports as one queue item on one operation by default. The native importer respects physical units, the view box, transforms, curves, and fill rules. It asks for a finished width when the physical size is ambiguous. Object assignment is under **Advanced**.
 - The native planner checks the full job before starting and breaks large jobs into bounded batches at path boundaries. A long continuous contour stays intact and uses the JCZ driver’s packetization. Crosshatch runs two perpendicular directions within each pass. Pass count is independently configurable.
 - The hardware worker runs in a separate Windows process and receives an explicit Stop message. USB ownership is shared with the legacy entry point through a lock. The native path stops on the first USB transfer error during a mark and reports interrupted or uncertain results for operator review.
-- Machine profiles are stored by source and lens. The EZCAD2 importer reads `markcfg7` and a matching JCZ `.cor` file, reports applied, missing, and unsupported settings, and validates the correction table before connecting. Review the actual machine’s settings in the editor. OpenLaser has tools for an outline test square, filled test square, and copper coupon matrix. Recipes can record the lens, stock, and copper thickness.
+- Machine profiles are stored by source and lens. The EZCAD2 importer reads `markcfg7` and a matching JCZ `.cor` file, reports applied, missing, and unsupported settings, and validates the correction table before connecting. Review the actual machine’s settings in the editor. StudioLaser has tools for an outline test square, filled test square, and copper coupon matrix. Recipes can record the lens, stock, and copper thickness.
 - Gerber preparation uses Gerbonara and Shapely. File roles use Gerber X2 metadata where present, with filename hints and manual mapping for older or ambiguous files. The code uses routed outline centerlines, handles clear primitives and negative copper file polarity, and supports Excellon routed slots and KiCad’s alternate G85 slots.
-- The original `elegant-galileo` checkout was preserved. Its source received fixes for lost Gerber arc regions, shared board-origin mirroring, and preview/export consistency. The existing Gerber2Laser executable was separate from this build. The new standalone SVG command uses the same PCB preparation code as the native OpenLaser app.
+- The original `elegant-galileo` checkout was preserved. Its source received fixes for lost Gerber arc regions, shared board-origin mirroring, and preview/export consistency. The existing Gerber2Laser executable was separate from this build. The new standalone SVG command uses the same PCB preparation code as the native StudioLaser app.
 
 ## Rebuild and verify
 
@@ -90,7 +103,7 @@ Run the build and test commands from the repository root in an x64 Windows Pytho
 
 ```powershell
 python -m pip install -e ".[desktop,freeze,dev]"
-python -m PyInstaller --noconfirm OpenLaser.spec
+python -m PyInstaller --noconfirm StudioLaser.spec
 python -m pytest tests -q
 ```
 
@@ -99,14 +112,14 @@ The PyInstaller specification bundles the app icon, Qt runtime, and libusb. It l
 Use the PCB SVG command for offline export.
 
 ```powershell
-openlaser pcb-svg --outline board-Edge_Cuts.gbr --top board-F_Cu.gbr --bottom board-B_Cu.gbr --drill board.drl --output svg
+studiolaser pcb-svg --outline board-Edge_Cuts.gbr --top board-F_Cu.gbr --bottom board-B_Cu.gbr --drill board.drl --output svg
 ```
 
 The CLI uses isolation by default. Use `--mode full-clear` for full removal outside the retained copper, `--flip-axis horizontal` for a top-to-bottom flip, and repeated `--drill` arguments for multiple drill files.
 
 ### Verification results
 
-- 128 OpenLaser tests and 13 Gerber2Laser tests passed. The Gerber2Laser suite emitted a parser warning about the bundled sample Gerber’s implicit circular-arc interpolation mode.
+- 128 StudioLaser tests and 13 Gerber2Laser tests passed. The Gerber2Laser suite emitted a parser warning about the bundled sample Gerber’s implicit circular-arc interpolation mode.
 - The dense-job regression checked 30,001 ordered paths against mock JCZ packets, including a continuous contour longer than one batch. Other regressions covered SVG sizing and fill rules, PCB polarity and registration, slot exclusion, stop and disconnect handling, stale arming, and queue recovery.
 - The rebuilt executable opened and closed normally from an isolated folder without a Python executable on its search path. The frozen Windows hardware worker also completed a mock engraving job.
 

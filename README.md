@@ -1,10 +1,10 @@
-# OpenLaser
+# StudioLaser
 
 <p align="center">
-  <img src="assets/icons/openmopa.png" alt="OpenLaser icon" width="160">
+  <img src="assets/icons/openmopa.png" alt="StudioLaser icon" width="160">
 </p>
 
-OpenLaser is an open-source desktop application for JPT MOPA fiber galvo
+StudioLaser is an open-source desktop application for JPT MOPA fiber galvo
 lasers on JCZ/BJJCZ LMC controllers, built around one job: making
 double-sided PCBs on a **ComMarker B6 MOPA**. It replaces EZCAD2 or LightBurn
 for that workflow.
@@ -18,7 +18,7 @@ for that workflow.
 SVG, DXF and STL artwork can be engraved too.
 
 > [!IMPORTANT]
-> OpenLaser is early-stage software that controls equipment capable of causing
+> StudioLaser is early-stage software that controls equipment capable of causing
 > fires, eye injuries, burns, fumes, and machine damage. Never leave a running
 > machine unattended. Wear eyewear rated for 1064 nm (OD 6+ with an EN 207 LB
 > rating), enclose the beam, extract fumes (FR4 and solder mask give off
@@ -35,23 +35,23 @@ SVG, DXF and STL artwork can be engraved too.
 
 ### Standalone Windows executable
 
-Open `OpenLaser.exe` on Windows 11 or Windows 10 version 1809 or later (x64).
+Open `StudioLaser.exe` on Windows 11 or Windows 10 version 1809 or later (x64).
 It bundles Python, Qt, the PCB converter and libusb. To build it from source:
 
 ```powershell
 python -m pip install -e ".[desktop,freeze]"
-python -m PyInstaller --noconfirm OpenLaser.spec
+python -m PyInstaller --noconfirm StudioLaser.spec
 ```
 
-The build is written to `dist\OpenLaser.exe`.
+The build is written to `dist\StudioLaser.exe`.
 
 ### Source installers
 
-| System | Run | Start OpenLaser with |
+| System | Run | Start StudioLaser with |
 | --- | --- | --- |
-| Windows 10 / 11 | `Install OpenLaser.bat` | the **OpenLaser** shortcut on the Desktop and in the Start menu |
-| macOS | `Install OpenLaser.command` | `OpenLaser.app` |
-| Linux | `bash install-openlaser.sh` | **OpenLaser** in your applications menu |
+| Windows 10 / 11 | `Install StudioLaser.bat` | the **StudioLaser** shortcut on the Desktop and in the Start menu |
+| macOS | `Install StudioLaser.command` | `StudioLaser.app` |
+| Linux | `bash install-studiolaser.sh` | **StudioLaser** in your applications menu |
 
 Each needs Python 3.10 or newer ([python.org/downloads](https://www.python.org/downloads/);
 on Windows tick **Add python.exe to PATH**). Download the repository as a ZIP,
@@ -62,19 +62,19 @@ browser interface.
 ### Developers
 
 ```bash
-git clone https://github.com/luizbueno3d/OpenLaser.git
-cd OpenLaser
+git clone https://github.com/MLags101/StudioLaser.git
+cd StudioLaser
 python -m venv .venv
 .venv\Scripts\activate            # macOS / Linux: source .venv/bin/activate
 python -m pip install -e ".[desktop,dev]"
-openlaser desktop
+studiolaser desktop
 python -m pytest tests -q
 ```
 
 ### USB driver
 
 - **Windows:** the laser normally uses the EZCAD (BJJCZ) driver, which
-  OpenLaser cannot use. Switch it to WinUSB once:
+  StudioLaser cannot use. Switch it to WinUSB once:
   1. Connect the laser by USB and power it on.
   2. Download **Zadig** from [zadig.akeo.ie](https://zadig.akeo.ie/) and open it.
   3. In **Options**, enable **List All Devices**.
@@ -83,13 +83,17 @@ python -m pytest tests -q
 
   After this, EZCAD and LightBurn cannot use the laser on this PC until you
   put their driver back (Device Manager → USBLMCV4 → Update driver).
-- **Linux:** install the udev rule: `sudo cp scripts/99-openlaser.rules /etc/udev/rules.d/`,
+- **Linux:** install the udev rule: `sudo cp scripts/99-studiolaser.rules /etc/udev/rules.d/`,
   then `sudo udevadm control --reload-rules && sudo udevadm trigger`, and replug the laser.
 - **macOS:** nothing to do.
 
 The status chip at the top right of the window shows **Laser connected**,
-**Wrong USB driver**, **Two lasers found** or **Laser offline**; hover it for
-the reason. `openlaser detect` prints the same diagnosis without sending any
+**Wrong USB driver**, **Choose a laser** or **Laser offline**; hover it for the
+reason. Click it to choose which laser to use when more than one is plugged in.
+Each laser is listed by its USB bus and port, and the choice is remembered as
+long as that laser stays in the same USB socket. If the chosen laser is
+unplugged, StudioLaser refuses to run rather than switch to another one.
+**Automatic** uses whichever single laser is connected. `studiolaser detect` prints the same diagnosis without sending any
 laser command.
 
 ## The window
@@ -136,9 +140,9 @@ The pulse widths and their frequency limits come from the JPT M7 60 W manual
 
 1. **Choose the lens correction to start from.** EZCAD can correct the lens
    either with the `.cor` file or with its own bulge/skew/trapezoid numbers.
-   OpenLaser imports whichever EZCAD had switched on. If you are unsure which is
+   StudioLaser imports whichever EZCAD had switched on. If you are unsure which is
    right for your machine, mark the same grid with each and keep the one whose
-   spans measure closest to the grid size. OpenLaser's version of EZCAD's
+   spans measure closest to the grid size. StudioLaser's version of EZCAD's
    parametric correction is an approximation, because EZCAD's formula is not
    published.
 2. **Mark a grid** on card, painted metal or anodised aluminium: add the grid to
@@ -179,7 +183,7 @@ stays at its maximum but average power drops.
 
 1. **Export** copper, mask, silkscreen, outline and drill files from your CAD
    tool at 1:1 from the same origin the CNC used, **unmirrored**.
-2. **Import PCB.** Select all the files; OpenLaser detects each one's role from
+2. **Import PCB.** Select all the files; StudioLaser detects each one's role from
    Gerber X2 attributes or its file name, and you can correct it. Choose
    *Isolation channels* or *Full clear*, the isolation width, the kerf
    compensation, and which way you will flip the board.
@@ -194,11 +198,21 @@ stays at its maximum but average power drops.
    Rotation turns about the design's centre. It is aligned when every red ring
    sits centred in its hole. The drop-down on the Frame button chooses what is
    traced: outline and holes, outline only, bounding box, or the whole design.
-4. **Check it precisely (optional): Register on holes.** Click a hole on the
-   canvas, steer the red dot into that hole on the board, repeat for a second
-   hole far from the first. A third or fourth hole checks the fit and each
-   hole's error is shown. Without a drill file, a rectangular board registers on
-   its corners.
+4. **Check it precisely (optional): Register.** Choose what to register on:
+   - **Drilled holes.** Click a hole on the canvas, steer the red dot into that
+     hole on the board, and repeat for a second hole far from the first. A third
+     or fourth hole checks the fit, and each hole's error is shown.
+   - **Board edge (edge cuts).** Frame first so the outline is roughly on the
+     board. Then click any point on the outline on the canvas (the pick snaps to
+     the edge) and steer the red dot onto that edge of the real board. Any spot
+     along the edge will do. Use three or more points on at least two edges;
+     corners and opposite edges fit best. Each point is fitted only to the edge
+     it was picked on, and its distance from that edge is shown. If the points
+     cannot fix both position and rotation (all on one straight edge, say), the
+     dialog asks for another point instead of guessing.
+
+   **Check with red light** traces the fitted result (hole rings, or the outline)
+   before you apply it.
 5. Tick **Side and alignment checked**, then **Preview** (toolpaths and time
    estimate), **Arm**, **Start**. Arming lasts 30 seconds and is cancelled by any
    edit; moving the board clears the tick.
@@ -206,13 +220,13 @@ stays at its maximum but average power drops.
    holes, and run it. The bottom side cannot be armed until the top is
    complete.
 
-Plated holes and vias are a separate step; OpenLaser does not make them.
+Plated holes and vias are a separate step; StudioLaser does not make them.
 
 ## Projects and settings
 
-- **File → Save Project** writes a `.openlaser.json` file with the job list,
+- **File → Save Project** writes a `.studiolaser.json` file with the job list,
   placements, settings and job status.
-- Per-user state is in `%LOCALAPPDATA%\OpenLaser` (`~/.config/OpenLaser` on
+- Per-user state is in `%LOCALAPPDATA%\StudioLaser` (`~/.config/StudioLaser` on
   macOS and Linux): `active-machine.json`, `recipes.json` (presets) and
   `recovery.json` (the job list, restored on the next start).
 - A job that was running when the app closed reopens as *interrupted*. Check
@@ -245,14 +259,21 @@ Plated holes and vias are a separate step; OpenLaser does not make them.
 ## Command line
 
 ```bash
-openlaser                 # start the desktop app
-openlaser detect          # USB diagnosis, no laser commands
-openlaser pulse-widths    # pulse widths of a profile
-openlaser pcb-svg --outline board-Edge_Cuts.gbr --top board-F_Cu.gbr --bottom board-B_Cu.gbr --drill board.drl --output svg
+studiolaser                 # start the desktop app
+studiolaser detect          # USB diagnosis, no laser commands
+studiolaser pulse-widths    # pulse widths of a profile
+studiolaser pcb-svg --outline board-Edge_Cuts.gbr --top board-F_Cu.gbr --bottom board-B_Cu.gbr --drill board.drl --output svg
 ```
 
 Set `OPENMOPA_MOCK=1` to run the whole application against a simulated
 controller with no laser attached.
+
+## History
+
+StudioLaser began as a fork of [OpenLaser](https://github.com/luizbueno3d/OpenLaser) by
+Luiz Bueno and was renamed when it became a dedicated PCB tool for the ComMarker B6.
+Settings, presets and project files from OpenLaser are picked up automatically, and
+the old `openlaser` and `openlaser-desktop` commands still work.
 
 ## License and security
 

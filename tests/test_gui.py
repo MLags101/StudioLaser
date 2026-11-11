@@ -237,14 +237,45 @@ def test_window_builds_in_both_themes_and_canvas_click_does_not_move_the_job(app
             dialog = window.registration
             assert isinstance(dialog, RegistrationDialog) and canvas.picking
             true = Placement(4, -2, 7)
+            assert dialog.mode.currentData() == "holes" and dialog.mode.count() == 2
             for index, hole in enumerate(c.job.references):
-                dialog.add_point(index)
-                dialog.points[index][1][:] = true.apply(hole)
+                dialog.add_hole(index)
+                dialog.points[index][2][:] = true.apply(hole)
             dialog._fill()
             assert dialog.result.worst < 1e-6
             dialog.accept()
             assert c.job.placement.x == pytest.approx(4) and c.job.placement.angle == pytest.approx(7)
             assert not canvas.picking and c.target is None and not c.is_verified()
+            # Edge registration: points anywhere along the real board's edges fix the placement.
+            window.open_registration()
+            dialog = window.registration
+            dialog.mode.setCurrentIndex(dialog.mode.findData("edge"))
+            assert canvas.pick_mode == "edge"
+            true = Placement(5.5, -1.0, 9)
+            for design in ((-10, -4), (0, 5), (10, 1)):          # on the left, top and right edges
+                dialog.add_edge(*design)
+                dialog.points[-1][2][:] = true.apply(design)
+            dialog._fill()
+            assert dialog.result is not None and dialog.result.worst < 0.002
+            dialog.accept()
+            assert c.job.placement.x == pytest.approx(5.5, abs=0.002)
+            assert c.job.placement.angle == pytest.approx(9, abs=0.01)
+            # Clicking an operation's tick box used to crash the app: the tree rebuilt itself mid-click.
+            tree = window.jobs.tree
+            child = tree.topLevelItem(c.current).child(0)
+            rect = tree.visualItemRect(child)
+            before = c.job.objects[0].layer.output
+            QTest.mouseClick(tree.viewport(), Qt.MouseButton.LeftButton, pos=rect.topLeft() + QPoint(10, rect.height() // 2))
+            app.processEvents()
+            assert c.job.objects[0].layer.output != before
+            tree.topLevelItem(c.current).child(0).setCheckState(0, Qt.CheckState.Checked if not c.job.objects[0].layer.output
+                                                                else Qt.CheckState.Unchecked)
+            app.processEvents()
+            assert c.job.objects[0].layer.output == before
+            # Choosing a preset from the drop-down replaces the drop-down's own items: also deferred.
+            window.inspector.preset.setCurrentIndex(1)
+            window.inspector.preset.activated.emit(1)
+            app.processEvents()
         finally:
             c.shutdown()
             window.close()

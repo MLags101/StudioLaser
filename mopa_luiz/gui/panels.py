@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit,
     QProgressBar,
@@ -17,6 +17,20 @@ from ..layers import RASTER_ENGRAVE, VECTOR_ENGRAVE
 from ..presets import layer_summary
 from ..workspace import KIND_LABELS
 from . import theme
+
+def later(parent, slot) -> QTimer:
+    """A zero-delay single-shot timer: ``.start()`` runs ``slot`` once, after the current event.
+
+    Panels must not clear and rebuild their widgets from inside a signal sent by one of those
+    widgets (a tick box, a drop-down); Qt is still using the item and the app crashes.
+    Several requests during one event also collapse into one rebuild.
+    """
+    timer = QTimer(parent)
+    timer.setSingleShot(True)
+    timer.setInterval(0)
+    timer.timeout.connect(slot)
+    return timer
+
 
 STATUS_TEXT = {"ready": "", "running": "Running", "interrupted": "Interrupted — review", "complete": "Done"}
 
@@ -112,9 +126,10 @@ class JobsPanel(QWidget):
         self.down = button("▼ Down", lambda: controller.move_job(1), tip="Move this job later in the list")
         self.remove = button("Remove", lambda: controller.remove_job())
         layout.addLayout(row(self.up, self.down, self.remove))
-        controller.jobs_changed.connect(self.rebuild)
-        controller.selection_changed.connect(self.rebuild)
-        controller.job_changed.connect(self.rebuild)
+        self.request_rebuild = later(self, self.rebuild)
+        controller.jobs_changed.connect(self.request_rebuild.start)
+        controller.selection_changed.connect(self.request_rebuild.start)
+        controller.job_changed.connect(self.request_rebuild.start)
         controller.state_changed.connect(self.refresh_state)
         self.rebuild()
 
@@ -272,8 +287,8 @@ class Inspector(QScrollArea):
         jog_box.addLayout(steps, 1)
         form.addRow(jog_box)
         self.centre = button("Centre in field", lambda: self._set_xy(0, 0))
-        self.register = button("Register on holes…", self.register_requested.emit, primary=True,
-                               tip="Fit the board's position from its drilled holes using the red light")
+        self.register = button("Register…", self.register_requested.emit, primary=True,
+                               tip="Fit the board's position with the red light, on its drilled holes or its edges")
         form.addRow(row(self.centre, self.register))
         self.field_issue = QLabel()
         self.field_issue.setObjectName("issue")
@@ -353,11 +368,12 @@ class Inspector(QScrollArea):
         layout.addWidget(self.estimate)
         layout.addStretch(1)
 
+        self.request_reload = later(self, self.reload)
         controller.selection_changed.connect(self._selection_changed)
-        controller.job_changed.connect(self.reload)
+        controller.job_changed.connect(self.request_reload.start)
         controller.placement_changed.connect(self.reload_placement)
-        controller.profile_changed.connect(self.reload)
-        controller.presets_changed.connect(self.reload)
+        controller.profile_changed.connect(self.request_reload.start)
+        controller.presets_changed.connect(self.request_reload.start)
         controller.plan_changed.connect(self.reload_estimate)
         controller.state_changed.connect(self.reload_state)
         self.reload()
@@ -366,11 +382,11 @@ class Inspector(QScrollArea):
 
     def _selection_changed(self):
         self.operation = 0
-        self.reload()
+        self.request_reload.start()
 
     def select_operation(self, index: int):
         self.operation = index
-        self.reload()
+        self.request_reload.start()
 
     def reload(self):
         job = self.controller.job
@@ -422,11 +438,13 @@ class Inspector(QScrollArea):
             board = bool(job.side)
             self.scale.setEnabled(not board)
             self.mirror.setEnabled(not board)
-            self.register.setVisible(board and len(job.references) >= 2)
-            self.register.setText("Register on holes…" if job.holes else "Register on corners…")
+            self.register.setVisible(board and (len(job.references) >= 2 or bool(job.boundary)))
+            self.register.setText("Register on holes or edge…" if job.references and job.holes
+                                  else "Register on edge…")
             self.side_hint.setText(
-                "Bottom side: flip the board, then register it on its holes." if job.side == "bottom" else
-                "Top side: place the board, register it on its holes, then tick the box.")
+                "Bottom side: flip the board, frame it into place or register it, then tick the box."
+                if job.side == "bottom" else
+                "Top side: frame it into place or register it on its holes or edge, then tick the box.")
         self._loading = False
         self.reload_placement()
         self.reload_estimate()
@@ -517,7 +535,7 @@ class Inspector(QScrollArea):
     def _operation_picked(self, index):
         if not self._loading and index >= 0:
             self.operation = index
-            self.reload()
+            self.request_reload.start()
 
     def _layer_edited(self):
         job = self.controller.job

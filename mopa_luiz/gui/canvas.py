@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QTransform
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView
 
@@ -56,6 +56,7 @@ def placement_transform(placement) -> QTransform:
 class Canvas(QGraphicsView):
     cursor_moved = Signal(float, float)
     reference_picked = Signal(int)
+    edge_picked = Signal(float, float)   # a point on the board outline, in design millimetres
 
     def __init__(self, controller, parent=None):
         super().__init__(parent)
@@ -70,8 +71,10 @@ class Canvas(QGraphicsView):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setMinimumSize(320, 240)
-        self.picking = False          # registration: clicks choose a drilled hole
-        self.picked: list[int] = []   # reference indices highlighted in order
+        self.picking = False          # registration is choosing points on the canvas
+        self.pick_mode = "holes"      # "holes": click a drilled hole; "edge": click the board outline
+        self.marks: list[tuple[float, float]] = []   # placed points already chosen, numbered in order
+        self._hover_point = None      # where a click would pick, in placed millimetres
         self._job_item = None
         self._preview_item = None
         self._target_item = None
@@ -82,8 +85,14 @@ class Canvas(QGraphicsView):
         self._pan = None
         self._hover = -1
         self._fitted = False
+        # Rebuilding the scene from inside the signal that changed the job can delete items Qt is
+        # still using, so rebuilds wait until the current event has finished, and repeats coalesce.
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(0)
+        self._rebuild_timer.timeout.connect(self.rebuild)
         controller.selection_changed.connect(self.rebuild_and_fit)
-        controller.job_changed.connect(self.rebuild)
+        controller.job_changed.connect(self._rebuild_timer.start)
         controller.placement_changed.connect(self.update_placement)
         controller.plan_changed.connect(self.update_preview)
         controller.state_changed.connect(self.update_frame_overlay)
@@ -97,7 +106,7 @@ class Canvas(QGraphicsView):
         return QRectF(-profile.width / 2, -profile.height / 2, profile.width, profile.height)
 
     def rebuild_and_fit(self):
-        self.rebuild()
+        self._rebuild_timer.start()
         self.fit()
 
     def rebuild(self):
@@ -265,18 +274,19 @@ class Canvas(QGraphicsView):
         scale = self.transform().m11()
         step = self._grid_step(scale)
         for spacing, token in ((step, "grid"), (step * 5, "grid_major")):
-            pen = QPen(theme.color(token), 0)
-            painter.setPen(pen)
+            painter.setPen(QPen(theme.color(token), 0))
+            lines = []          # drawn in one call: hundreds of separate calls per repaint add up
             x = math.floor(max(rect.left(), field.left()) / spacing) * spacing
             while x <= min(rect.right(), field.right()):
                 if x >= field.left():
-                    painter.drawLine(QPointF(x, field.top()), QPointF(x, field.bottom()))
+                    lines.append(QLineF(x, field.top(), x, field.bottom()))
                 x += spacing
             y = math.floor(max(rect.top(), field.top()) / spacing) * spacing
             while y <= min(rect.bottom(), field.bottom()):
                 if y >= field.top():
-                    painter.drawLine(QPointF(field.left(), y), QPointF(field.right(), y))
+                    lines.append(QLineF(field.left(), y, field.right(), y))
                 y += spacing
+            painter.drawLines(lines)
         axis = QPen(theme.color("field", 150), 0, Qt.PenStyle.DashLine)
         painter.setPen(axis)
         painter.drawLine(QPointF(0, field.top()), QPointF(0, field.bottom()))
@@ -301,18 +311,19 @@ class Canvas(QGraphicsView):
         font = QFont(painter.font())
         font.setPointSizeF(8)
         painter.setFont(font)
-        # Registration holes: numbers for picked ones, a ring under the cursor.
-        if job is not None and job.references and (self.picking or self.picked):
-            for index, point in enumerate(job.references):
-                if index not in self.picked and index != self._hover:
-                    continue
-                pos = self.mapFromScene(self._scene_point(job.placement.apply(point)))
+        # Registration: numbered rings on chosen points, a ring under the cursor where a click would pick.
+        if job is not None and self.picking:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for number, point in enumerate(self.marks, start=1):
+                pos = self.mapFromScene(self._scene_point(point))
                 painter.setPen(QPen(theme.color("target"), 2))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawEllipse(pos, 9, 9)
-                if index in self.picked:
-                    painter.setPen(theme.color("text"))
-                    painter.drawText(pos.x() + 12, pos.y() - 6, str(self.picked.index(index) + 1))
+                painter.setPen(theme.color("text"))
+                painter.drawText(pos.x() + 12, pos.y() - 6, str(number))
+            if self._hover_point is not None:
+                pos = self.mapFromScene(self._scene_point(self._hover_point))
+                painter.setPen(QPen(theme.color("target", 170), 1.5, Qt.PenStyle.DashLine))
+                painter.drawEllipse(pos, 9, 9)
         # Rulers.
         painter.fillRect(0, 0, view.width(), RULER, theme.color("panel"))
         painter.fillRect(0, 0, RULER, view.height(), theme.color("panel"))
@@ -375,6 +386,28 @@ class Canvas(QGraphicsView):
                 best, best_distance = index, distance
         return best
 
+    def _nearest_edge(self, view_pos):
+        """Closest point on the board outline to the cursor, as (design point, placed point), or None."""
+        job = self.controller.job
+        if job is None or not job.boundary:
+            return None
+        from ..workspace import nearest_on_paths
+
+        design, distance, _ = nearest_on_paths(job.boundary, job.placement.invert(self._world(view_pos)))
+        if distance * job.placement.scale * self.transform().m11() > PICK_RADIUS * 1.5:
+            return None
+        return design, job.placement.apply(design)
+
+    def _pick_at(self, view_pos):
+        """What a click here would choose: (reference index or design point, placed point), or None."""
+        job = self.controller.job
+        if job is None:
+            return None
+        if self.pick_mode == "edge":
+            return self._nearest_edge(view_pos)
+        index = self._nearest_reference(view_pos)
+        return (index, job.placement.apply(job.references[index])) if index >= 0 else None
+
     def _over_job(self, view_pos) -> bool:
         job = self.controller.job
         box = job.bounds() if job else None
@@ -392,9 +425,11 @@ class Canvas(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         elif event.button() == Qt.MouseButton.LeftButton:
             if self.picking:
-                index = self._nearest_reference(pos)
-                if index >= 0:
-                    self.reference_picked.emit(index)
+                pick = self._pick_at(pos)
+                if pick is not None and self.pick_mode == "edge":
+                    self.edge_picked.emit(*pick[0])
+                elif pick is not None:
+                    self.reference_picked.emit(pick[0])
             elif self.controller.job and self._over_job(pos) and not self.controller.blockers()["edit"]:
                 self._press = (pos, self._world(pos), self.controller.job.placement)
                 self._dragging = False
@@ -425,11 +460,12 @@ class Canvas(QGraphicsView):
                 replace(placement, x=round(placement.x + x - origin[0], 3), y=round(placement.y + y - origin[1], 3)),
                 merge="drag")
         elif self.picking:
-            hover = self._nearest_reference(pos)
-            if hover != self._hover:
-                self._hover = hover
+            pick = self._pick_at(pos)
+            hover = pick[1] if pick else None
+            if hover != self._hover_point:
+                self._hover_point = hover
                 self.viewport().update()
-            self.setCursor(Qt.CursorShape.PointingHandCursor if hover >= 0 else Qt.CursorShape.CrossCursor)
+            self.setCursor(Qt.CursorShape.PointingHandCursor if pick else Qt.CursorShape.CrossCursor)
         else:
             self.setCursor(Qt.CursorShape.OpenHandCursor if self._over_job(pos) and not self.controller.marking
                            else Qt.CursorShape.ArrowCursor)
