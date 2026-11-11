@@ -16,3 +16,13 @@ markcfg*
 dist/
 build/
 *.egg-info/
+
+# Separate nested project and local build output
+elegant-galileo/
+.pytest_cache/
+# The B6's factory files are committed once, as test fixtures; loose copies elsewhere stay local.
+/MarkParam.lib
+!tests/fixtures/b6_60w/
+!tests/fixtures/b6_60w/markcfg7
+!tests/fixtures/b6_60w/jcz15.cor
+!tests/fixtures/b6_60w/MarkParam.lib

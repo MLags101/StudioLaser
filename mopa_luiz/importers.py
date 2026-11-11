@@ -28,9 +28,9 @@ def import_geometry(filename: str, data_url_or_text: str) -> dict[str, Any]:
     elif suffix == "stl":
         polylines = parse_stl(raw)
         flip_y = False
-        preserve_units = False
+        preserve_units = True
         unit_scale = 1.0
-        unit_name = "stl_units"
+        unit_name = "millimeters"
     else:
         raise ValueError("supported imports: .svg, .dxf, .stl")
     polylines = [poly for poly in polylines if len(poly) >= 2]
@@ -253,7 +253,7 @@ def parse_svg_path(d: str) -> list[Polyline]:
 
 
 def parse_dxf(text: str) -> list[Polyline]:
-    pairs = dxf_pairs(text)
+    pairs = dxf_entities(dxf_pairs(text))
     polylines: list[Polyline] = []
     i = 0
     while i < len(pairs):
@@ -290,6 +290,28 @@ def parse_dxf(text: str) -> list[Polyline]:
             continue
         i += 1
     return polylines
+
+
+def dxf_entities(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep only model geometry: block definitions (BLOCKS) are not drawn.
+
+    Fragments with no ENTITIES section keep everything outside other sections.
+    """
+    kept: list[tuple[str, str]] = []
+    outside: list[tuple[str, str]] = []
+    section = None
+    found = False
+    for index, (code, value) in enumerate(pairs):
+        if code == "0" and value == "SECTION":
+            section = pairs[index + 1][1].upper() if index + 1 < len(pairs) and pairs[index + 1][0] == "2" else ""
+            found = found or section == "ENTITIES"
+        elif code == "0" and value == "ENDSEC":
+            section = None
+        elif section == "ENTITIES":
+            kept.append((code, value))
+        elif section is None:
+            outside.append((code, value))
+    return kept if found else outside
 
 
 def dxf_pairs(text: str) -> list[tuple[str, str]]:

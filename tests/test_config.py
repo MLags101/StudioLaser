@@ -1,11 +1,14 @@
+import contextlib
+import io
+import json
 import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from mopa_luiz import cli
 from mopa_luiz.cli import (
     JPT_M7_PULSE_WIDTHS_NS,
-    build_test_box_plan,
     load_markcfg,
     nearest_pulse_width,
 )
@@ -63,35 +66,42 @@ class PulseWidthGuardTests(unittest.TestCase):
             self.assertIn(nearest_pulse_width(raw), JPT_M7_PULSE_WIDTHS_NS)
 
 
-class TestBoxPlanTests(unittest.TestCase):
-    def setUp(self):
-        self._fix = _CfgFixture(SAMPLE_MARKCFG)
-        self.cfg = load_markcfg(self._fix.path)
+class CliTests(unittest.TestCase):
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(list(argv))
+        return code, out.getvalue()
 
-    def tearDown(self):
-        self._fix.cleanup()
+    def profile_command(self, command, text):
+        fix = _CfgFixture(text)
+        try:
+            code, out = self.run_cli(command, "--profile", str(fix.path))
+        finally:
+            fix.cleanup()
+        self.assertEqual(code, 0)
+        return json.loads(out)
 
-    def test_blocks_power_above_100_percent(self):
-        with self.assertRaises(ValueError):
-            build_test_box_plan(
-                self.cfg, power=101.0, frequency_khz=30.0,
-                pulse_width_ns=200.0, size_mm=10.0,
-            )
+    def test_pulse_widths_honours_profile_override(self):
+        report = self.profile_command("pulse-widths", SAMPLE_MARKCFG + "PULSEWIDTHS=25, 10,500\n")
+        self.assertEqual(report["pulse_widths_ns"], [10, 25, 500])
 
-    def test_frequency_must_be_within_markcfg_bounds(self):
-        with self.assertRaises(ValueError):
-            build_test_box_plan(
-                self.cfg, power=1.0, frequency_khz=0.1,
-                pulse_width_ns=200.0, size_mm=10.0,
-            )
+    def test_pulse_widths_defaults_to_m7_table(self):
+        report = self.profile_command("pulse-widths", SAMPLE_MARKCFG)
+        self.assertEqual(report["pulse_widths_ns"], list(JPT_M7_PULSE_WIDTHS_NS))
 
-    def test_pulse_width_is_snapped(self):
-        plan = build_test_box_plan(
-            self.cfg, power=1.0, frequency_khz=30.0,
-            pulse_width_ns=199.0, size_mm=10.0,
-        )
-        self.assertEqual(plan["effective_pulse_width_ns"], 200)
-        self.assertTrue(plan["pulse_width_was_snapped"])
+    def test_show_config_reads_the_profile(self):
+        self.assertEqual(self.profile_command("show-config", SAMPLE_MARKCFG)["FIELDSIZE"], "200")
+
+    def test_no_command_opens_the_desktop_app(self):
+        parser = cli.build_parser()
+        self.assertIs(parser.parse_args([]).func, cli.desktop_command)
+        self.assertIs(parser.parse_args(["desktop"]).func, cli.desktop_command)
+
+    def test_retired_commands_are_gone(self):
+        for command in ("ui", "machines", "plan-test-box", "inspect-profile"):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                cli.build_parser().parse_args([command])
 
 
 if __name__ == "__main__":

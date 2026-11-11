@@ -1,8 +1,7 @@
 import unittest
-from pathlib import Path
 from unittest import mock
 
-from mopa_luiz import cli, ui, usb_backend
+from mopa_luiz import cli, usb_backend
 
 
 class LibusbBackendTests(unittest.TestCase):
@@ -53,22 +52,6 @@ class DetectHintTests(unittest.TestCase):
     def test_unplugged_laser_hint(self):
         hint = cli.detect_hint(seen_by_os=False, usable=False, libusb_ok=True)
         self.assertIn("USB cable", hint)
-
-
-class SecondLaunchTests(unittest.TestCase):
-    def test_second_launch_reuses_the_running_server(self):
-        with mock.patch.object(ui, "openlaser_running", return_value=True), \
-             mock.patch.object(ui, "open_default_browser", return_value=True) as browser, \
-             mock.patch.object(ui, "ThreadingHTTPServer") as server:
-            ui.serve("127.0.0.1", 8765, Path("profile.ini"), open_browser=True)
-        server.assert_not_called()
-        browser.assert_called_once_with("http://127.0.0.1:8765")
-
-    def test_port_taken_by_another_program_gives_a_clear_error(self):
-        with mock.patch.object(ui, "openlaser_running", return_value=False), \
-             mock.patch.object(ui, "ThreadingHTTPServer", side_effect=OSError("in use")):
-            with self.assertRaisesRegex(OSError, "--port"):
-                ui.serve("127.0.0.1", 8765, Path("profile.ini"), open_browser=False)
 
 
 if __name__ == "__main__":

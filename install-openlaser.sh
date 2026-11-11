@@ -51,7 +51,7 @@ if [ ! -x ".venv/bin/python" ]; then
   "$PYTHON" -m venv .venv
 fi
 ./.venv/bin/python -m pip install --quiet --upgrade pip
-./.venv/bin/python -m pip install --quiet -e . \
+./.venv/bin/python -m pip install --quiet -e ".[desktop]" \
   || fail "The installation step failed." \
 "Check your internet connection and run this installer again.
 If it keeps failing, please open an issue at
@@ -65,10 +65,10 @@ cat > "$APPS_DIR/openlaser.desktop" <<EOF
 Type=Application
 Name=OpenLaser
 Comment=Prepare and run laser and plotter jobs
-Exec="$PROJECT_DIR/.venv/bin/openlaser" ui
+Exec="$PROJECT_DIR/.venv/bin/openlaser-desktop"
 Path=$PROJECT_DIR
 Icon=$PROJECT_DIR/assets/icons/openmopa-256.png
-Terminal=true
+Terminal=false
 Categories=Graphics;Engineering;
 EOF
 chmod +x "$APPS_DIR/openlaser.desktop"
@@ -99,10 +99,10 @@ printf '\n\033[1;32mDone! OpenLaser is installed.\033[0m\n'
 cat <<'EOF'
 
   * Open your applications menu and start "OpenLaser".
-    A terminal window opens (keep it open) and your browser shows OpenLaser.
+    The OpenLaser desktop workspace opens.
   * Tip: right-click OpenLaser in the menu or dock and choose
     "Add to Favorites" / "Pin" for one-click launching.
-  * To quit OpenLaser, close that terminal window.
+  * To quit OpenLaser, close its window.
   * If you move this folder somewhere else later, run this installer again.
 
 EOF

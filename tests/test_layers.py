@@ -1,16 +1,21 @@
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from mopa_luiz.cli import MarkConfig
 from mopa_luiz.layers import (
+    DISABLED,
+    FRAME_ONLY,
+    NUMBERS,
+    RASTER_ENGRAVE,
+    VECTOR_CUT,
+    VECTOR_ENGRAVE,
     LayerSpec,
-    default_layers,
-    emitting_jobs,
-    framing_jobs,
-    group_by_layer,
     layer_from_dict,
     validate_layers,
 )
+
+PASSES_ERROR = "passes must be between 1 and 999"
 
 
 def fake_cfg() -> MarkConfig:
@@ -18,74 +23,72 @@ def fake_cfg() -> MarkConfig:
                       values={"MINPWMFREQ": "1000", "MAXPWMFREQ": "4000000"})
 
 
-class DefaultLayersTests(unittest.TestCase):
-    def test_default_layers_pass_validation(self):
-        errors = validate_layers(default_layers(), fake_cfg())
-        self.assertEqual(errors, {})
+def layer(operation=VECTOR_ENGRAVE, **overrides) -> LayerSpec:
+    return replace(LayerSpec(
+        layer_id="layer", name="Layer", operation=operation, power_percent=50.0,
+        frequency_khz=30.0, pulse_width_ns=200.0, speed_mm_s=1000.0,
+    ), **overrides)
+
+
+class ValidateLayersTests(unittest.TestCase):
+    def errors(self, spec, cfg=fake_cfg()):
+        return validate_layers([spec], cfg).get("layer", [])
+
+    def test_valid_layers_pass(self):
+        for operation in (VECTOR_ENGRAVE, VECTOR_CUT, RASTER_ENGRAVE, FRAME_ONLY, DISABLED):
+            self.assertEqual(self.errors(layer(operation)), [])
+        self.assertEqual(self.errors(layer(passes=999)), [])
 
     def test_raster_layer_with_invalid_pitch_is_flagged(self):
-        layers = default_layers()
-        for layer in layers:
-            if layer.operation == "raster_engrave":
-                layer.output = True
-                layer.raster_pitch_mm = 0
-        errors = validate_layers(layers, fake_cfg())
-        self.assertIn("raster", errors)
-        self.assertTrue(any("pitch" in e for e in errors["raster"]))
+        self.assertTrue(any("pitch" in e for e in self.errors(layer(RASTER_ENGRAVE, raster_pitch_mm=0))))
 
     def test_layer_above_100_percent_flagged(self):
-        layers = default_layers()
-        for layer in layers:
-            if layer.operation == "vector_cut":
-                layer.power_percent = 101
-        errors = validate_layers(layers, fake_cfg())
-        self.assertIn("vector-cut", errors)
+        self.assertTrue(self.errors(layer(VECTOR_CUT, power_percent=101)))
+
+    def test_passes_must_be_an_integer_from_1_to_999(self):
+        for passes in (0, -1, 1000, 2.5, 2.0, True, "3", None, float("nan")):
+            for operation in (VECTOR_ENGRAVE, FRAME_ONLY):
+                self.assertEqual(self.errors(layer(operation, passes=passes)), [PASSES_ERROR], passes)
+
+    def test_non_finite_numbers_are_rejected_on_every_layer(self):
+        for name in NUMBERS:
+            for value in (float("nan"), float("inf"), "12"):
+                for operation in (VECTOR_ENGRAVE, RASTER_ENGRAVE, DISABLED):
+                    for cfg in (fake_cfg(), None):
+                        self.assertEqual(
+                            self.errors(layer(operation, **{name: value}), cfg),
+                            [f"{name} must be a finite number"],
+                        )
+
+    def test_emission_flags(self):
+        self.assertTrue(layer().emits_when_marking())
+        self.assertTrue(layer(RASTER_ENGRAVE).emits_when_marking())
+        self.assertFalse(layer(FRAME_ONLY).emits_when_marking())
+        self.assertFalse(layer(DISABLED).emits_when_marking())
+        self.assertFalse(layer(output=False).emits_when_marking())
 
 
-class GroupingTests(unittest.TestCase):
-    def test_group_by_layer_keeps_order(self):
-        layers = default_layers()
-        objects = [
-            {"layer_id": "vector-cut", "polylines": [[(0, 0), (1, 1)]]},
-            {"layer_id": "vector-engrave", "polylines": [[(0, 0), (2, 2)]]},
-            {"layer_id": "vector-engrave", "polylines": [[(0, 0), (3, 3)]]},
-        ]
-        jobs = group_by_layer(objects, layers)
-        ids = [job.layer.layer_id for job in jobs]
-        # Order must match layer-list order, not object insertion order.
-        self.assertEqual(ids, ["vector-engrave", "vector-cut", "raster", "frame-only"])
-        eng = next(j for j in jobs if j.layer.layer_id == "vector-engrave")
-        self.assertEqual(len(eng.polylines), 2)
+class LayerFromDictTests(unittest.TestCase):
+    def test_round_trip(self):
+        spec = layer(passes=2, raster_pitch_mm=0.05, crosshatch=True)
+        self.assertEqual(layer_from_dict(spec.to_dict()), spec)
 
-    def test_emitting_jobs_filters_disabled_and_frame_only(self):
-        layers = default_layers()
-        objects = [
-            {"layer_id": "vector-engrave", "polylines": [[(0, 0), (1, 1)]]},
-            {"layer_id": "raster",         "polylines": [[(0, 0), (2, 2)]]},
-            {"layer_id": "frame-only",     "polylines": [[(0, 0), (3, 3)]]},
-        ]
-        jobs = group_by_layer(objects, layers)
-        emitting = emitting_jobs(jobs)
-        # Raster now emits (its hatch lines are generated at mark time).
-        self.assertEqual(
-            sorted(j.layer.layer_id for j in emitting),
-            ["raster", "vector-engrave"],
-        )
-        framing = framing_jobs(jobs)
-        # Frame-only and raster (visible) should still be available for framing,
-        # but disabled is excluded — and there is no disabled object here.
-        self.assertGreaterEqual(len(framing), 1)
+    def test_unknown_operation_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown layer operation"):
+            layer_from_dict({"operation": "plasma"})
 
-    def test_layer_from_dict_round_trip(self):
-        spec = LayerSpec(
-            layer_id="custom", name="Custom", operation="vector_engrave",
-            power_percent=2.0, frequency_khz=40, pulse_width_ns=200,
-            speed_mm_s=500, passes=2,
-        )
-        clone = layer_from_dict(spec.to_dict())
-        self.assertEqual(clone.layer_id, "custom")
-        self.assertEqual(clone.passes, 2)
-        self.assertEqual(clone.operation, "vector_engrave")
+    def test_passes_are_validated(self):
+        self.assertEqual(layer_from_dict({}).passes, 1)
+        self.assertEqual(layer_from_dict({"passes": 999}).passes, 999)
+        for passes in (0, -3, 1000, 2.5, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, PASSES_ERROR):
+                layer_from_dict({"passes": passes})
+
+    def test_non_finite_numbers_are_rejected(self):
+        for name in NUMBERS:
+            for value in (float("nan"), float("-inf"), "nan"):
+                with self.assertRaisesRegex(ValueError, f"{name} must be a finite number"):
+                    layer_from_dict({name: value})
 
 
 if __name__ == "__main__":

@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openlaser"
 version = "0.2.0"
-description = "Safety-first open-source workspace for galvo lasers, gantry lasers, and pen plotters."
+description = "Safety-first open-source workspace for JCZ/LMC galvo fiber lasers."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Luiz Bueno" }]
-keywords = ["mopa", "co2", "diode", "plotter", "grbl", "galvo", "laser", "jcz", "lmc"]
+keywords = ["mopa", "fiber", "galvo", "laser", "jcz", "lmc", "pcb"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Manufacturing",
@@ -26,7 +26,7 @@ classifiers = [
 # wheels for these platforms; elsewhere (Windows on ARM, 32-bit Raspberry Pi)
 # requiring it would break the install, and the system libusb is used instead.
 dependencies = [
-  "galvoplotter",
+  "galvoplotter>=0.2,<0.3",
   "pyusb",
   "libusb-package; sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine != 'ARM64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
 ]
@@ -34,11 +34,16 @@ dependencies = [
 [project.optional-dependencies]
 # Kept so older install commands (pip install -e ".[hardware]") still work.
 hardware = []
-dev = []
+desktop = ["PySide6>=6.6", "svgelements>=1.9.6", "shapely>=2.0", "gerbonara>=1.5", "numpy>=1.24"]
+freeze = ["pyinstaller>=6.6,<7; sys_platform == 'win32'"]
+dev = ["pytest"]
 
 [project.scripts]
 openlaser = "mopa_luiz.cli:main"
 openmopa = "mopa_luiz.cli:main"
 
-[tool.setuptools]
-packages = ["mopa_luiz"]
+[project.gui-scripts]
+openlaser-desktop = "mopa_luiz.desktop:main"
+
+[tool.setuptools.packages.find]
+include = ["mopa_luiz*"]

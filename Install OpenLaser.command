@@ -49,7 +49,7 @@ if [ ! -x ".venv/bin/python" ]; then
   "$PYTHON" -m venv .venv
 fi
 ./.venv/bin/python -m pip install --quiet --upgrade pip
-./.venv/bin/python -m pip install --quiet -e . \
+./.venv/bin/python -m pip install --quiet -e ".[desktop]" \
   || fail "The installation step failed." \
 "Check your internet connection and run this installer again.
 If it keeps failing, please open an issue at

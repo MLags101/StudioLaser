@@ -33,25 +33,25 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -m pip install --quiet --upgrade pip
 if errorlevel 1 goto :install_failed
-".venv\Scripts\python.exe" -m pip install --quiet -e .
+".venv\Scripts\python.exe" -m pip install --quiet -e ".[desktop]"
 if errorlevel 1 goto :install_failed
 
 echo.
 echo ==^> Step 3 of 3: Creating OpenLaser shortcuts
 set "OPENLASER_DIR=%CD%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$dir = $env:OPENLASER_DIR; $shell = New-Object -ComObject WScript.Shell; foreach ($folder in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) { $link = $shell.CreateShortcut((Join-Path $folder 'OpenLaser.lnk')); $link.TargetPath = (Join-Path $dir '.venv\Scripts\openlaser.exe'); $link.Arguments = 'ui'; $link.WorkingDirectory = $dir; $link.IconLocation = (Join-Path $dir 'assets\icons\openmopa.ico'); $link.Description = 'OpenLaser'; $link.Save() }"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$dir = $env:OPENLASER_DIR; $shell = New-Object -ComObject WScript.Shell; foreach ($folder in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) { $link = $shell.CreateShortcut((Join-Path $folder 'OpenLaser.lnk')); $link.TargetPath = (Join-Path $dir '.venv\Scripts\openlaser-desktop.exe'); $link.Arguments = ''; $link.WorkingDirectory = $dir; $link.IconLocation = (Join-Path $dir 'assets\icons\openmopa.ico'); $link.Description = 'OpenLaser'; $link.Save() }"
 if errorlevel 1 (
   echo Could not create the shortcuts. You can still start OpenLaser by double-clicking
-  echo .venv\Scripts\openlaser.exe and typing: ui
+  echo .venv\Scripts\openlaser-desktop.exe
 )
 
 echo.
 echo Done! OpenLaser is installed.
 echo.
 echo   * Double-click "OpenLaser" on your Desktop (or find it in the Start menu).
-echo     A black window opens (keep it open) and your browser shows OpenLaser.
+echo     The OpenLaser desktop workspace opens.
 echo   * Tip: right-click the shortcut and choose "Pin to taskbar".
-echo   * To quit OpenLaser, close that black window.
+echo   * To quit OpenLaser, close its window.
 echo   * JCZ/LMC MOPA laser users: Windows needs the WinUSB driver for the
 echo     laser first. See "Windows: connect a JCZ/LMC MOPA laser" in README.md.
 echo   * If you move this folder somewhere else later, run this installer again.
@@ -74,9 +74,10 @@ pause
 exit /b 1
 
 :install_failed
+set "CODE=%errorlevel%"
 echo.
-echo The installation step failed.
-echo Check your internet connection and run this installer again.
+echo The installation step failed (Python/pip exit code %CODE%).
+echo The messages above say why. Fix that, then run this installer again.
 echo If it keeps failing, please open an issue at
 echo https://github.com/luizbueno3d/OpenLaser/issues with a screenshot of this window.
 echo.

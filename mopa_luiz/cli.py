@@ -21,7 +21,6 @@ DEFAULT_PROFILE = Path(os.environ.get(
         Path(__file__).resolve().parents[1] / "profiles" / "openmopa-machine.ini",
     ),
 ))
-DEFAULT_MARKCFG = DEFAULT_PROFILE
 
 JCZ_VENDOR_ID = 0x9588
 JCZ_PRODUCT_ID = 0x9899
@@ -107,23 +106,18 @@ def nearest_pulse_width(value: float, table: tuple[int, ...] = JPT_M7_PULSE_WIDT
     return min(table, key=lambda candidate: abs(candidate - value))
 
 
-def frequency_to_period(frequency_khz: float, base: float = 20000.0) -> int:
-    if frequency_khz <= 0:
-        raise ValueError("frequency must be positive")
-    return int(round(base / frequency_khz)) & 0xFFFF
-
-
-def power_to_mark_current(power_percent: float) -> int:
-    if not 0 <= power_percent <= 100:
-        raise ValueError("power must be between 0 and 100 percent")
-    return int(round(power_percent * 0xFFF / 100.0))
-
-
 def run_command(args: list[str]) -> tuple[int, str]:
     if shutil.which(args[0]) is None:
         return 127, f"{args[0]} not found"
-    proc = subprocess.run(args, capture_output=True, text=True, check=False)
-    return proc.returncode, (proc.stdout + proc.stderr).strip()
+    # A windowed app on Windows gets a console window flashed up for every child
+    # process unless it asks for none; the desktop app runs this in the background.
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
+                              creationflags=flags, timeout=20, encoding="utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 124, f"{args[0]} did not finish: {exc}"
+    return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
 
 
 def pyusb_probe() -> dict[str, Any]:
@@ -255,157 +249,74 @@ def show_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def pulse_widths(_: argparse.Namespace) -> int:
-    print(json.dumps({"jpt_m7_pulse_widths_ns": JPT_M7_PULSE_WIDTHS_NS}, indent=2))
-    return 0
-
-
-def list_machines(_: argparse.Namespace) -> int:
-    from .machines import machine_catalog
-
-    print(json.dumps({"machines": machine_catalog()}, indent=2))
-    return 0
-
-
-def build_test_box_plan(
-    cfg: MarkConfig,
-    power: float,
-    frequency_khz: float,
-    pulse_width_ns: float,
-    size_mm: float,
-    arm: bool = False,
-) -> dict[str, Any]:
-    min_freq_hz = cfg.get_int("MINPWMFREQ", 1000) or 1000
-    max_freq_hz = cfg.get_int("MAXPWMFREQ", 4000000) or 4000000
-    requested_freq_hz = frequency_khz * 1000.0
-    if requested_freq_hz < min_freq_hz or requested_freq_hz > max_freq_hz:
-        raise ValueError(
-            f"frequency {requested_freq_hz:.0f} Hz outside machine profile bounds "
-            f"{min_freq_hz}..{max_freq_hz} Hz"
-        )
-    if power < 0.0 or power > 100.0:
-        raise ValueError("test power must be between 0% and 100%.")
-    table = pulse_width_table(cfg)
-    snapped_pw = nearest_pulse_width(pulse_width_ns, table)
-    commands = [
-        {
-            "name": "listMarkCurrent",
-            "opcode": "0x8012",
-            "value": power_to_mark_current(power),
-            "source": f"{power:.3g}% power",
-        },
-        {
-            "name": "listQSwitchPeriod",
-            "opcode": "0x801b",
-            "value": frequency_to_period(frequency_khz),
-            "source": f"{frequency_khz:.3g} kHz",
-        },
-        {
-            "name": "listFiberYLPMPulseWidth",
-            "opcode": "0x8026",
-            "value": snapped_pw,
-            "source": f"{pulse_width_ns:.3g} ns requested",
-        },
-        {
-            "name": "geometry",
-            "shape": "box",
-            "size_mm": size_mm,
-            "origin": "center",
-        },
-    ]
-    return {
-        "mode": "armed" if arm else "dry-run",
-        "emission_enabled": False,
-        "reason": "hardware emission is intentionally not implemented in this first prototype",
-        "profile": str(cfg.path),
-        "field_size_mm": cfg.get_float("FIELDSIZE"),
-        "power_percent": power,
-        "frequency_khz": frequency_khz,
-        "requested_pulse_width_ns": pulse_width_ns,
-        "effective_pulse_width_ns": snapped_pw,
-        "pulse_width_was_snapped": snapped_pw != pulse_width_ns,
-        "commands": commands,
-    }
-
-
-def plan_test_box(args: argparse.Namespace) -> int:
+def pulse_widths(args: argparse.Namespace) -> int:
     cfg = load_markcfg(args.profile)
-    plan = build_test_box_plan(
-        cfg,
-        power=args.power,
-        frequency_khz=args.frequency_khz,
-        pulse_width_ns=args.pulse_width_ns,
-        size_mm=args.size_mm,
-        arm=args.arm,
-    )
-    print(json.dumps(plan, indent=2))
-    if args.arm:
-        print("\n--arm was accepted for planning only. No USB commands were sent.")
+    print(json.dumps({"profile": str(cfg.path), "pulse_widths_ns": pulse_width_table(cfg)}, indent=2))
     return 0
 
 
-def serve_ui_command(args: argparse.Namespace) -> int:
-    from .ui import serve
+def desktop_command(_: argparse.Namespace) -> int:
+    try:
+        from .desktop import main as desktop_main
+    except ImportError as exc:
+        raise RuntimeError(
+            f'the desktop app needs the [desktop] extra ({exc}). Run: pip install -e ".[desktop]"'
+        ) from exc
+    return desktop_main() or 0
 
-    serve(
-        host=args.host,
-        port=args.port,
-        markcfg=args.profile,
-        open_browser=not args.no_browser,
+
+def export_pcb_svg(args: argparse.Namespace) -> int:
+    from .pcb.board import prepare_board
+    from .pcb.inverter import InversionMode
+    from .pcb.svg_exporter import export_to_svg
+
+    copper = {key: [path] for key, path in (("top_copper", args.top), ("bottom_copper", args.bottom)) if path}
+    sides = prepare_board(
+        {"outline": [args.outline], "drill": args.drill, **copper},
+        mode=InversionMode.ISOLATION if args.mode == "isolation" else InversionMode.FULL_INVERT,
+        isolation_width=args.isolation_width, flip_axis=args.flip_axis,
     )
-    return 0
-
-
-def inspect_profile(args: argparse.Namespace) -> int:
-    from .profile import inspect_path
-
-    print(json.dumps(inspect_path(args.profile), indent=2))
+    for side in sides:
+        output = args.output / f"{args.outline.stem}-{side.side}.svg"
+        export_to_svg(side.removal, str(output), view_bounds=side.outline.bounds)
+        print(output)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="openlaser",
-        description="OpenLaser: safety-first jobs for galvo, gantry laser, and plotter machines.",
+        description="OpenLaser: safety-first jobs for JCZ/LMC galvo fiber lasers. "
+        "Without a command, the desktop workspace opens.",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.set_defaults(func=desktop_command)
+    sub = parser.add_subparsers(dest="command")
+    profile = {"dest": "profile", "metavar": "PROFILE", "type": Path, "default": DEFAULT_PROFILE}
+
+    p = sub.add_parser("desktop", help="Open the native OpenLaser workspace (the default).")
+    p.set_defaults(func=desktop_command)
 
     p = sub.add_parser("detect", help="Check local USB/runtime readiness without laser commands.")
     p.set_defaults(func=detect)
 
     p = sub.add_parser("show-config", help="Parse the machine profile and print mapped fields.")
-    p.add_argument("--profile", "--markcfg", dest="profile", metavar="PROFILE", type=Path, default=DEFAULT_PROFILE)
+    p.add_argument("--profile", "--markcfg", **profile)
     p.set_defaults(func=show_config)
 
-    p = sub.add_parser("pulse-widths", help="Print the guarded JPT M7 pulse-width table.")
+    p = sub.add_parser("pulse-widths", help="Print the pulse-width table the machine profile accepts.")
+    p.add_argument("--profile", "--markcfg", **profile)
     p.set_defaults(func=pulse_widths)
 
-    p = sub.add_parser("machines", help="List built-in machine profiles and capabilities.")
-    p.set_defaults(func=list_machines)
-
-    p = sub.add_parser("plan-test-box", help="Plan a test box without emission.")
-    p.add_argument("--profile", "--markcfg", dest="profile", metavar="PROFILE", type=Path, default=DEFAULT_PROFILE)
-    p.add_argument("--power", type=float, default=100.0, help="Power percent; valid range is 0..100.")
-    p.add_argument("--frequency-khz", type=float, default=30.0)
-    p.add_argument("--pulse-width-ns", type=float, default=200.0)
-    p.add_argument("--size-mm", type=float, default=10.0)
-    p.add_argument("--arm", action="store_true", help="Accepted for planning; still no emission.")
-    p.set_defaults(func=plan_test_box)
-
-    p = sub.add_parser("ui", help="Open the local dry-run web UI.")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--profile", "--markcfg", dest="profile", metavar="PROFILE", type=Path, default=DEFAULT_PROFILE)
-    p.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Start the UI server without opening the system's default browser.",
-    )
-    p.set_defaults(func=serve_ui_command)
-
-    p = sub.add_parser("inspect-profile", help="Report which machine profile fields are applied/unused.")
-    p.add_argument("--profile", "--markcfg", dest="profile", metavar="PROFILE", type=Path, default=DEFAULT_PROFILE)
-    p.set_defaults(func=inspect_profile)
+    p = sub.add_parser("pcb-svg", help="Export registered copper-removal SVGs without hardware.")
+    p.add_argument("--outline", type=Path, required=True)
+    p.add_argument("--top", type=Path)
+    p.add_argument("--bottom", type=Path)
+    p.add_argument("--drill", type=Path, action="append", default=[])
+    p.add_argument("--mode", choices=("isolation", "full-clear"), default="isolation")
+    p.add_argument("--isolation-width", type=float, default=0.25, metavar="MM")
+    p.add_argument("--flip-axis", choices=("vertical", "horizontal"), default="vertical")
+    p.add_argument("--output", type=Path, required=True, metavar="DIRECTORY")
+    p.set_defaults(func=export_pcb_svg)
     return parser
 
 
