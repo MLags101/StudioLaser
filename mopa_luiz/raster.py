@@ -123,6 +123,70 @@ def hatch_polylines(
     )
 
 
+def contour_hatch(rings, pitch, angle):
+    """Offset toward each island's interior, leaving holes outside the paths."""
+    from .pcb.board import contours, polygon_region, polygons
+
+    result = []
+    fallback = False
+    for island in polygons(polygon_region(rings)):
+        inset = island.buffer(-pitch / 2)
+        if inset.is_empty:
+            fallback = True
+            original = contours(island)
+            paths = hatch_polylines(original, angle_deg=angle, pitch_mm=pitch).segments
+            if not paths:
+                # A narrow, off-grid island can fall between all scan lines.
+                # Pass a scan line through a point known to be inside it.
+                from shapely import affinity
+                from shapely.geometry import LineString
+
+                point = island.representative_point()
+                span = math.hypot(island.bounds[2] - island.bounds[0], island.bounds[3] - island.bounds[1])
+                line = LineString([(point.x - span, point.y), (point.x + span, point.y)])
+                clipped = island.intersection(affinity.rotate(line, angle, origin=point))
+                paths = [tuple(part.coords) for part in getattr(clipped, "geoms", (clipped,))
+                         if part.geom_type == "LineString" and not part.is_empty]
+            result.extend(paths)
+            continue
+        # Offset the original each time to avoid compounding polygon approximation.
+        xmin, ymin, xmax, ymax = island.bounds
+        max_steps = math.ceil(min(xmax - xmin, ymax - ymin) / (2 * pitch))
+        for index in range(max_steps):
+            if index:
+                inset = island.buffer(-(index + 0.5) * pitch)
+            if inset.is_empty:
+                break
+            result.extend(contours(inset))
+    return result, fallback
+
+
+def radial_hatch(rings, pitch):
+    """Spokes on a round annular coupon, with pitch measured at the outer edge."""
+    from shapely.geometry import LineString
+    from .pcb.board import polygon_region
+
+    region = polygon_region(rings)
+    if region.geom_type != "Polygon" or len(region.interiors) != 1:
+        raise ValueError("Radial spokes require one annular coupon with a center exclusion")
+    xmin, ymin, xmax, ymax = region.bounds
+    cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
+    radius = (xmax - xmin) / 2
+    outer = [math.hypot(x - cx, y - cy) for x, y in region.exterior.coords]
+    inner = [math.hypot(x - cx, y - cy) for x, y in region.interiors[0].coords]
+    if radius <= 0 or min(inner) <= 0 or max(outer) - min(outer) > radius * 0.01:
+        raise ValueError("Radial spokes require a circular outer edge and a center exclusion")
+    count = max(3, math.ceil(2 * math.pi * radius / pitch))
+    paths = []
+    for i in range(count):
+        angle = 2 * math.pi * i / count
+        end = cx + 2 * radius * math.cos(angle), cy + 2 * radius * math.sin(angle)
+        clipped = region.intersection(LineString([(cx, cy), end]))
+        paths.extend(tuple(part.coords) for part in getattr(clipped, "geoms", (clipped,))
+                     if part.geom_type == "LineString" and not part.is_empty)
+    return paths
+
+
 def _inside(point: Point, ring: Polyline) -> bool:
     x, y = point
     inside = False

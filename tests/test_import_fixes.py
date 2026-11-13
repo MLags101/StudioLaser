@@ -170,7 +170,8 @@ def board_files(tmp_path):
 
 def test_board_side_fields_and_mask_silk_layers(tmp_path):
     assert list(BoardSide.__dataclass_fields__) == [
-        "side", "outline", "boundary", "retained", "removal", "mask_openings", "silkscreen", "references", "origin"]
+        "side", "outline", "boundary", "retained", "removal", "mask_openings", "silkscreen", "references", "origin", "flip",
+        "inferred", "drawn_copper"]
     front, back = prepare_board(board_files(tmp_path), mode=InversionMode.ISOLATION)
     assert (front.side, back.side) == ("top", "bottom")
     assert front.mask_openings.symmetric_difference(box(2.9, 3.9, 5.1, 6.1)).area < 1e-9

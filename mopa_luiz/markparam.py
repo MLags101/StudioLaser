@@ -93,4 +93,6 @@ def guess_kind(name: str) -> str:
         return "cleanup"
     if "silk" in key or "legend" in key:
         return "silk"
+    if key == "pcben":
+        return "copper_fill"
     return ""

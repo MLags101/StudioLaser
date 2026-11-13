@@ -1,0 +1,19 @@
+# Windows version resource for StudioLaser.exe (PyInstaller). An exe without one looks anonymous
+# to antivirus heuristics.
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=(0, 2, 0, 0), prodvers=(0, 2, 0, 0), mask=0x3f, flags=0x0, OS=0x40004,
+                    fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable("040904B0", [
+      StringStruct("CompanyName", "StudioLaser"),
+      StringStruct("FileDescription", "StudioLaser desktop app for JCZ/LMC galvo lasers"),
+      StringStruct("FileVersion", "0.2.0"),
+      StringStruct("InternalName", "StudioLaser"),
+      StringStruct("LegalCopyright", "MIT License"),
+      StringStruct("OriginalFilename", "StudioLaser.exe"),
+      StringStruct("ProductName", "StudioLaser"),
+      StringStruct("ProductVersion", "0.2.0"),
+    ])]),
+    VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+  ],
+)

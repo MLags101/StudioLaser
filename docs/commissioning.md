@@ -1,8 +1,7 @@
 # Commissioning StudioLaser on a ComMarker B6 MOPA
 
-StudioLaser has been exercised against a simulated controller and automated
-tests only. This checklist covers what has to be confirmed on the real machine,
-in order. Stop at the first step that fails and report it.
+Use this checklist to verify the current build on the B6. Stop at the first
+step that fails and save the report from **Help → Copy Problem Report**.
 
 Wear eyewear rated for 1064 nm, keep the enclosure closed when emitting, run
 fume extraction, and keep the machine's own emergency stop within reach.
@@ -10,10 +9,10 @@ fume extraction, and keep the machine's own emergency stop within reach.
 ## 1. Connection
 
 - [ ] Install the WinUSB driver with Zadig (README → USB driver).
-- [ ] Start StudioLaser. The chip at the top right reads **Laser connected**.
+- [ ] Start StudioLaser. The chip at the top right reads **Laser detected**.
 - [ ] Unplug USB: the chip changes to **Laser offline** within a few seconds.
 - [ ] With EZCAD's driver installed instead, the chip reads **Wrong USB driver**.
-      If it reads *Laser connected* and framing then fails, note the error text:
+      If it reads *Laser detected* and the handshake fails, note the error text:
       on some systems libusb lists a device it cannot open.
 
 ## 2. Machine Setup
@@ -27,6 +26,18 @@ fume extraction, and keep the machine's own emergency stop within reach.
 
 ## 3. Red light and Stop, no emission
 
+- [ ] With marking disabled, run the known-good OpenLaser build and the frozen
+      StudioLaser candidate on the same board, PC, cable and port. Close one
+      app before opening the other. Run **Machine → Connection Test** in
+      StudioLaser and confirm all six stages pass.
+- [ ] On the candidate, complete three five-minute continuous frames and ten
+      stop/reconnect cycles without a drop or power cycle. Move the frame while
+      it is running. If only StudioLaser drops, compare the first failed
+      command and status with the OpenLaser run. If both drop, check Windows USB
+      events and change one physical variable at a time.
+- [ ] With marking disabled, deliberately unplug USB during a frame. Confirm
+      that StudioLaser reports an unknown machine state and requires an idle
+      acknowledgement before it can run another operation.
 - [ ] Tools → Outline Test Square, 40 mm. **Frame**: the red square appears,
       centred under the lens, and is not mirrored or rotated a quarter turn.
       If it is, change the axis options in Machine Setup.

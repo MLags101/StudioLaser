@@ -7,15 +7,15 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit,
-    QProgressBar,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
+    QMenu, QPlainTextEdit, QProgressBar,
     QPushButton, QScrollArea, QSpinBox, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..job_planner import format_duration, layer_issues
-from ..layers import RASTER_ENGRAVE, VECTOR_ENGRAVE
+from ..layers import HATCH_PATTERNS, RASTER_ENGRAVE, VECTOR_ENGRAVE
 from ..presets import layer_summary
-from ..workspace import KIND_LABELS
+from ..workspace import KIND_LABELS, KINDS
 from . import theme
 
 def later(parent, slot) -> QTimer:
@@ -98,6 +98,7 @@ class JobsPanel(QWidget):
     operation_selected = Signal(int)
     import_board = Signal()
     import_artwork = Signal()
+    add_file = Signal()
 
     def __init__(self, controller):
         super().__init__()
@@ -107,10 +108,15 @@ class JobsPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addLayout(row(
-            button("Import PCB…", self.import_board.emit, primary=True,
+            button("Import Gerber / PCB…", self.import_board.emit, primary=True,
                    tip="Gerber copper, mask, silkscreen, outline and drill files"),
-            button("Import Artwork…", self.import_artwork.emit, tip="SVG, DXF or STL"),
+            button("Import Artwork…", self.import_artwork.emit,
+                   tip="SVG, DXF, STL or single Gerber files, each as a job"),
         ))
+        self.add = button("Add File to Job…", self.add_file.emit,
+                          tip="Add SVG, DXF or Gerber files to the selected job, each as its own operation with its "
+                              "own settings. Right-click an operation to rename, duplicate, reorder or remove it.")
+        layout.addWidget(self.add)
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setColumnCount(1)
@@ -118,6 +124,9 @@ class JobsPanel(QWidget):
         self.tree.setUniformRowHeights(False)
         self.tree.currentItemChanged.connect(self._selected)
         self.tree.itemChanged.connect(self._toggled)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._menu)
+        self.tree.itemDoubleClicked.connect(lambda item, _column: self._rename(item))
         layout.addWidget(self.tree, 1)
         self.review = button("Review and allow re-run", controller.review,
                              tip="Confirm you checked the board, then make this job runnable again")
@@ -199,10 +208,53 @@ class JobsPanel(QWidget):
             if self.controller.job.objects[op].layer.output != wanted:
                 self.rebuild()
 
+    def _menu(self, position):
+        item = self.tree.itemAt(position)
+        if item is None or self.controller.blockers()["edit"]:
+            return
+        index, op = item.data(0, Qt.ItemDataRole.UserRole)
+        c = self.controller
+        if index != c.current:
+            c.select(index)
+        job = c.job
+        if job is None or index != c.current:
+            return
+        menu = QMenu(self)
+        menu.addAction("Add file to this job…", self.add_file.emit)
+        menu.addSeparator()
+        if op >= 0:
+            menu.addAction("Rename operation…", lambda: self._rename(item))
+            menu.addAction("Duplicate operation", lambda: c.duplicate_layer(op))
+            menu.addAction("Run earlier", lambda: c.move_layer(op, -1)).setEnabled(op > 0)
+            menu.addAction("Run later", lambda: c.move_layer(op, 1)).setEnabled(op < len(job.objects) - 1)
+            menu.addSeparator()
+            menu.addAction("Remove operation", lambda: c.remove_layer(op)).setEnabled(len(job.objects) > 1)
+        else:
+            menu.addAction("Rename job…", lambda: self._rename(item))
+            menu.addSeparator()
+            menu.addAction("Remove job", lambda: c.remove_job())
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def _rename(self, item):
+        if item is None or self.controller.blockers()["edit"]:
+            return
+        index, op = item.data(0, Qt.ItemDataRole.UserRole)
+        job = self.controller.job
+        if job is None or index != self.controller.current:
+            return
+        current = job.objects[op].name if op >= 0 else job.name
+        name, ok = QInputDialog.getText(self, "Rename", "Name:", text=current)
+        if ok:
+            if op >= 0:
+                self.controller.rename_layer(op, name)
+            else:
+                self.controller.rename_job(name)
+
     def refresh_state(self):
         job = self.controller.job
         locked = bool(self.controller.blockers()["edit"])
         self.review.setVisible(bool(job) and job.status in {"interrupted", "complete"})
+        self.add.setEnabled(not locked)
         for widget in (self.up, self.down, self.remove):
             widget.setEnabled(bool(job) and not locked)
         self.tree.setEnabled(not self.controller.marking)
@@ -320,6 +372,12 @@ class Inspector(QScrollArea):
         self.operation_pick = QComboBox()
         self.operation_pick.currentIndexChanged.connect(self._operation_picked)
         form.addRow("Operation", self.operation_pick)
+        self.kind = QComboBox()
+        for kind in ("", *KINDS):
+            self.kind.addItem(KIND_LABELS[kind], kind)
+        self.kind.setToolTip("What this operation is for. Presets saved for this type are listed first.")
+        self.kind.currentIndexChanged.connect(self._kind_picked)
+        form.addRow("Type", self.kind)
         self.preset = QComboBox()
         self.preset.setToolTip("Choose a preset to load its values into this operation")
         self.preset.activated.connect(self._preset_chosen)
@@ -345,17 +403,17 @@ class Inspector(QScrollArea):
         self.hatch_angle = number(0, -180, 180, 1, "°", 15)
         self.hatch_step = number(90, -180, 180, 1, "°", 15)
         self.hatch_step.setToolTip("Hatch direction turns by this much on each pass, which evens out the removal")
-        self.cross = QCheckBox("Cross-hatch each pass")
+        self.pattern = QComboBox()
         self.hatch_rows = []
-        for label, widget in (("Hatch spacing", self.pitch), ("Hatch angle", self.hatch_angle),
-                              ("Angle step / pass", self.hatch_step), ("", self.cross)):
+        for label, widget in (("Hatch pattern", self.pattern), ("Hatch spacing", self.pitch),
+                              ("Hatch angle", self.hatch_angle), ("Angle step / pass", self.hatch_step)):
             caption = QLabel(label)
             form.addRow(caption, widget)
             self.hatch_rows.append((caption, widget))
         for widget in (self.power, self.speed, self.frequency, self.passes, self.pitch, self.hatch_angle, self.hatch_step):
             widget.valueChanged.connect(self._layer_edited)
         self.pulse.currentIndexChanged.connect(self._layer_edited)
-        self.cross.toggled.connect(self._layer_edited)
+        self.pattern.currentIndexChanged.connect(self._layer_edited)
         self.issues = QLabel()
         self.issues.setObjectName("issue")
         self.issues.setWordWrap(True)
@@ -394,7 +452,7 @@ class Inspector(QScrollArea):
         self.empty.setVisible(job is None)
         for box in (self.placement_box, self.operation_box):
             box.setVisible(job is not None)
-        self.side_box.setVisible(bool(job and job.side))
+        self.side_box.setVisible(bool(job and (job.side or job.coupon)))
         self.operation_box.setVisible(bool(job and job.objects))
         if job is not None and job.objects:
             self.operation = max(0, min(self.operation, len(job.objects) - 1))
@@ -404,20 +462,30 @@ class Inspector(QScrollArea):
             self.operation_pick.addItems([obj.name for obj in job.objects])
             self.operation_pick.setCurrentIndex(self.operation)
             self.operation_pick.setVisible(len(job.objects) > 1)
+            self.kind.setCurrentIndex(max(0, self.kind.findData(artwork.kind)))
             self.preset.clear()
+            self.preset.setEnabled(not job.coupon)
             self.preset.addItem("Choose a preset…", "")
-            for preset in self.controller.presets.for_kind(artwork.kind):
-                self.preset.addItem(preset.label(), preset.preset_id)
-                self.preset.setItemData(self.preset.count() - 1, f"{preset.summary()}\n{preset.note}".strip(),
-                                        Qt.ItemDataRole.ToolTipRole)
-            # A PCB operation's mode is fixed by what it does; free artwork can be lines or fill.
-            show_mode = self._free_mode = not artwork.kind
-            self.mode.setVisible(show_mode)
-            self.mode_label.setVisible(show_mode)
+            # Every preset can be loaded into any operation; the ones made for this type come first.
+            matching = self.controller.presets.for_kind(artwork.kind)
+            others = [p for p in self.controller.presets.all() if p not in matching]
+            for group, presets in (("", matching), ("Presets for other operation types", others)):
+                if group and presets:
+                    self.preset.insertSeparator(self.preset.count())
+                    self.preset.addItem(group, "")
+                    self.preset.model().item(self.preset.count() - 1).setEnabled(False)
+                for preset in presets:
+                    label = preset.label() if not group else f"{preset.label()} — {KIND_LABELS.get(preset.kind, '')}"
+                    self.preset.addItem(label, preset.preset_id)
+                    self.preset.setItemData(self.preset.count() - 1, f"{preset.summary()}\n{preset.note}".strip(),
+                                            Qt.ItemDataRole.ToolTipRole)
+            # Any operation can follow its paths (lines) or hatch its closed shapes (fill).
+            self._free_mode = True
             self.mode.setCurrentIndex(1 if layer.operation == RASTER_ENGRAVE else 0)
             self.power.setValue(layer.power_percent)
             self.speed.setValue(layer.speed_mm_s)
             self.frequency.setValue(layer.frequency_khz)
+            self.frequency.setEnabled(not job.coupon)
             self.passes.setValue(layer.passes)
             widths = list(self.controller.profile.pulse_widths) or [2, 4, 6, 9, 13, 20, 30, 45, 60, 80, 100, 150, 200, 250, 350, 500]
             if int(layer.pulse_width_ns) not in widths:
@@ -429,22 +497,32 @@ class Inspector(QScrollArea):
             self.pitch.setValue(layer.raster_pitch_mm)
             self.hatch_angle.setValue(layer.raster_angle_deg)
             self.hatch_step.setValue(layer.raster_angle_step_deg)
-            self.cross.setChecked(layer.crosshatch)
+            self.pattern.clear()
+            for key, label in HATCH_PATTERNS.items():
+                if key != "radial" or layer.pattern == "radial":
+                    self.pattern.addItem(label, key)
+            self.pattern.setCurrentIndex(self.pattern.findData(layer.pattern))
+            self.pattern.setEnabled(not (job.coupon and layer.pattern == "radial"))
             raster = layer.operation == RASTER_ENGRAVE
             for caption, widget in self.hatch_rows:
-                caption.setVisible(raster)
-                widget.setVisible(raster)
+                show = raster and (layer.pattern != "radial" or widget not in (self.hatch_angle, self.hatch_step))
+                if layer.pattern == "contour" and widget is self.hatch_step:
+                    show = False
+                caption.setVisible(show)
+                widget.setVisible(show)
             self._show_issues(layer)
             board = bool(job.side)
             self.scale.setEnabled(not board)
             self.mirror.setEnabled(not board)
-            self.register.setVisible(board and (len(job.references) >= 2 or bool(job.boundary)))
-            self.register.setText("Register on holes or edge…" if job.references and job.holes
-                                  else "Register on edge…")
+            self.register.setVisible(board and (len(job.references) >= 2 or (job.boundary and not job.inferred)))
+            self.register.setText("Register on holes…" if job.inferred else
+                                  "Register on holes or edge…" if job.references and job.holes else "Register on edge…")
+            self.verified.setText("Stock covers the inferred work area and alignment is checked" if job.inferred else
+                                  "Coupon aligned on fresh scrap" if job.coupon else "Side and alignment checked")
             self.side_hint.setText(
-                "Bottom side: flip the board, frame it into place or register it, then tick the box."
-                if job.side == "bottom" else
-                "Top side: frame it into place or register it on its holes or edge, then tick the box.")
+                "Inferred work area. Frame it on the stock and confirm coverage." if job.inferred else
+                "Frame the coupon on matching scrap before confirming placement." if job.coupon else
+                f"{job.side.title()} side: frame or register the board, then confirm alignment.")
         self._loading = False
         self.reload_placement()
         self.reload_estimate()
@@ -479,6 +557,7 @@ class Inspector(QScrollArea):
             return
         lines = [f"Estimated time: {format_duration(plan.seconds)}  ({plan.paths:,} paths)"]
         lines += [f"  {name}: {format_duration(seconds)}" for name, seconds in plan.operations]
+        lines.extend(plan.notes)
         self.estimate.setText("\n".join(lines))
 
     def reload_state(self):
@@ -496,7 +575,8 @@ class Inspector(QScrollArea):
             box.setEnabled(not locked)
         self._loading = True
         self.verified.setChecked(self.controller.is_verified())
-        self.verified.setEnabled(bool(job) and not self.controller.marking and job.status == "ready")
+        self.verified.setEnabled(bool(job) and not self.controller.marking and job.status == "ready"
+                                 and not c.pending_first_side(job))
         self._loading = False
 
     def _show_issues(self, layer):
@@ -532,6 +612,10 @@ class Inspector(QScrollArea):
         if not self._loading:
             self.controller.set_verified(checked)
 
+    def _kind_picked(self, index):
+        if not self._loading and index >= 0 and self.controller.job is not None:
+            self.controller.set_layer_kind(self.operation, self.kind.currentData())
+
     def _operation_picked(self, index):
         if not self._loading and index >= 0:
             self.operation = index
@@ -547,7 +631,8 @@ class Inspector(QScrollArea):
             power_percent=self.power.value(), speed_mm_s=self.speed.value(), frequency_khz=self.frequency.value(),
             pulse_width_ns=float(self.pulse.currentData()), passes=self.passes.value(),
             raster_pitch_mm=self.pitch.value(), raster_angle_deg=self.hatch_angle.value(),
-            raster_angle_step_deg=self.hatch_step.value(), crosshatch=self.cross.isChecked(),
+            raster_angle_step_deg=self.hatch_step.value(), hatch_pattern=self.pattern.currentData() or "parallel",
+            crosshatch=self.pattern.currentData() == "crosshatch",
         ), merge=f"layer{self.operation}")
 
     def _preset_chosen(self, index):
@@ -556,9 +641,8 @@ class Inspector(QScrollArea):
         if job is None or preset is None:
             return
         current = job.objects[self.operation].layer
-        # Keep the operation's identity and, for PCB operations, its mode and enable tick.
-        layer = replace(preset.layer, layer_id=current.layer_id, name=current.name, output=current.output,
-                        operation=current.operation if job.objects[self.operation].kind else preset.layer.operation)
+        # Keep the operation's identity and its enable tick; take everything else, lines or fill included.
+        layer = replace(preset.layer, layer_id=current.layer_id, name=current.name, output=current.output)
         self.controller.set_layer(self.operation, layer)
         self.controller.say(f"Loaded preset “{preset.name}” into {job.objects[self.operation].name}.")
 

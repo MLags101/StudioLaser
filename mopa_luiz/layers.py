@@ -21,6 +21,8 @@ RASTER_ENGRAVE = "raster_engrave"
 FRAME_ONLY = "frame_only"
 DISABLED = "disabled"
 OPERATIONS = (VECTOR_ENGRAVE, VECTOR_CUT, RASTER_ENGRAVE, FRAME_ONLY, DISABLED)
+HATCH_PATTERNS = {"parallel": "Parallel lines", "crosshatch": "Crosshatch",
+                  "contour": "Contour offsets", "radial": "Radial spokes (coupon only)"}
 
 
 @dataclass
@@ -41,6 +43,11 @@ class LayerSpec:
     raster_angle_deg: float = 0.0
     raster_angle_step_deg: float = 90.0
     crosshatch: bool = False
+    hatch_pattern: str = ""
+
+    @property
+    def pattern(self) -> str:
+        return self.hatch_pattern or ("crosshatch" if self.crosshatch else "parallel")
 
     def emits_when_marking(self) -> bool:
         if not self.output:
@@ -78,6 +85,9 @@ def layer_from_dict(payload: dict) -> LayerSpec:
     passes = float(payload.get("passes", 1))
     if not passes.is_integer() or not 1 <= passes <= 999:
         raise ValueError(PASSES_ERROR)
+    pattern = str(payload.get("hatch_pattern", ""))
+    if pattern and pattern not in HATCH_PATTERNS:
+        raise ValueError(f"Unknown hatch pattern: {pattern}")
     return LayerSpec(
         layer_id=str(payload.get("layer_id") or payload.get("id") or "layer"),
         name=str(payload.get("name", "Layer")),
@@ -95,6 +105,7 @@ def layer_from_dict(payload: dict) -> LayerSpec:
         raster_angle_deg=_number(payload, "raster_angle_deg", 0.0),
         raster_angle_step_deg=_number(payload, "raster_angle_step_deg", 90.0),
         crosshatch=bool(payload.get("crosshatch", False)),
+        hatch_pattern=pattern,
     )
 
 

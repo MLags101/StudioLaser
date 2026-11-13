@@ -143,6 +143,24 @@ class Job:
     job_id: str = ""
     status: str = "ready"
     holes: bool = True    # references are drilled holes; False when they are board corners
+    # For a board side: the fabrication point that sits at this job's (0, 0), and the mirror
+    # applied for the bottom side ("vertical" or "horizontal"). None for boards imported before
+    # StudioLaser recorded it, and for plain artwork.
+    origin: Point | None = None
+    flip: str = ""
+    inferred: bool = False
+    first_side: str = "top"
+    coupon: bool = False
+    work_area: Paths = ()
+
+    def from_fabrication(self, point: Point) -> Point:
+        """Fabrication (Gerber) millimetres -> this board side's design millimetres."""
+        if self.origin is None:
+            raise ValueError("This board does not record its fabrication origin")
+        ox, oy = self.origin
+        sx = -1 if self.flip == "vertical" else 1
+        sy = -1 if self.flip == "horizontal" else 1
+        return (sx * (point[0] - ox), sy * (point[1] - oy))
 
     def frame(self) -> Paths:
         paths = self.boundary
@@ -346,7 +364,7 @@ def rectangle(x0, y0, x1, y1):
     return ((x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0))
 
 
-def job_from_board(name, side, board_id, layers=None):
+def job_from_board(name, side, board_id, layers=None, *, first_side="top"):
     """One job per board side, with one object per PCB operation in run order.
 
     ``layers`` maps an operation kind to the LayerSpec to start from.
@@ -362,7 +380,10 @@ def job_from_board(name, side, board_id, layers=None):
 
     removal = origin.paths(contours(side.removal))
     objects = []
-    if removal:
+    if removal and getattr(side, "drawn_copper", False):
+        objects.append(Artwork("Drawn copper shapes", removal, removal,
+                               new_layer("Drawn copper shapes", RASTER_ENGRAVE)))
+    elif removal:
         objects += [
             Artwork(KIND_LABELS[COPPER_CONTOUR], removal, removal, layer(COPPER_CONTOUR), COPPER_CONTOUR),
             Artwork(KIND_LABELS[COPPER_FILL], removal, removal, layer(COPPER_FILL), COPPER_FILL),
@@ -375,7 +396,7 @@ def job_from_board(name, side, board_id, layers=None):
     if not objects:
         raise ValueError(f"The {side.side} side has nothing to engrave")
     references, holes = tuple(side.references), True
-    if len(references) < 2:
+    if len(references) < 2 and not getattr(side, "inferred", False):
         # No drill file: fall back to the corners of a rectangular board.
         x0, y0, x1, y1 = side.outline.bounds
         if side.outline.area > 0.98 * (x1 - x0) * (y1 - y0):
@@ -386,6 +407,9 @@ def job_from_board(name, side, board_id, layers=None):
         retained=origin.paths(contours(side.retained)),
         references=tuple(map(origin.apply, references)),
         board_id=board_id, side=side.side, job_id=uuid4().hex, holes=holes,
+        origin=tuple(side.origin), flip=getattr(side, "flip", ""),
+        inferred=getattr(side, "inferred", False), first_side=first_side,
+        work_area=origin.paths(contours(side.boundary)),
     )
 
 
@@ -404,6 +428,15 @@ def read_paths(raw) -> Paths:
             raise ValueError("Project contains an invalid path")
         paths.append(points)
     return tuple(paths)
+
+
+def read_origin(raw) -> Point | None:
+    if raw is None:
+        return None
+    x, y = (float(value) for value in raw)
+    if not (math.isfinite(x) and math.isfinite(y)):
+        raise ValueError("Project contains an invalid board origin")
+    return (x, y)
 
 
 def save_project(path: Path, jobs: list[Job]) -> None:
@@ -435,7 +468,10 @@ def read_jobs(data) -> list[Job]:
         jobs.append(Job(raw["name"], objects, placement, read_paths(raw.get("boundary", [])),
                         read_paths(raw.get("retained", [])), references, raw.get("board_id", ""),
                         raw.get("side", ""), raw["job_id"], "interrupted" if status == "running" else status,
-                        bool(raw.get("holes", True))))
+                        bool(raw.get("holes", True)), read_origin(raw.get("origin")),
+                        str(raw.get("flip", "") or ""), bool(raw.get("inferred", False)),
+                        "bottom" if raw.get("first_side") == "bottom" else "top", bool(raw.get("coupon", False)),
+                        read_paths(raw.get("work_area", []))))
     if len({job.job_id for job in jobs}) != len(jobs):
         raise ValueError("Project contains duplicate job IDs")
     return jobs

@@ -26,7 +26,7 @@ classifiers = [
 # wheels for these platforms; elsewhere (Windows on ARM, 32-bit Raspberry Pi)
 # requiring it would break the install, and the system libusb is used instead.
 dependencies = [
-  "galvoplotter>=0.2,<0.3",
+  "galvoplotter==0.2.0",
   "pyusb",
   "libusb-package; sys_platform == 'darwin' or (sys_platform == 'win32' and platform_machine != 'ARM64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
 ]

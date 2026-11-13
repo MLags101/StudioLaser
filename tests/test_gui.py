@@ -354,13 +354,15 @@ def test_setup_calibration_import_and_preset_dialogs(app, tmp_path, monkeypatch)
         dialog = PcbImportDialog(paths, c)
         pump(app, c, lambda: dialog._future.done() and all(combo.isEnabled() for combo in dialog.roles), 20)
         assert dialog.inputs().keys() == {"outline", "top_copper", "bottom_copper", "drill"}
-        assert dialog.buttons.button(dialog.buttons.StandardButton.Ok).isEnabled()
+        assert dialog.review_button.isEnabled() and not dialog.add_button.isEnabled()
         dialog.roles[0].setCurrentIndex(dialog.roles[0].findData("other"))
         assert "outline" in dialog.problem.text()
         dialog.roles[0].setCurrentIndex(dialog.roles[0].findData("outline"))
         before = len(c.jobs)
-        c.import_board(dialog.inputs(), **dialog.settings())
-        pump(app, c, lambda: len(c.jobs) == before + 2, 30)
+        dialog.review()
+        pump(app, c, dialog.add_button.isEnabled, 30)
+        c.commit_gerber_import(dialog.jobs)
+        dialog.close()
         top = c.jobs[before]
         assert [obj.kind for obj in top.objects] == ["copper_contour", "copper_fill", "cleanup"]
         assert top.objects[0].layer.output and not top.objects[2].layer.output and top.references

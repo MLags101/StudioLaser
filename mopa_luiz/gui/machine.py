@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from base64 import b64encode
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
@@ -14,13 +16,13 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..correction import fit_field_map, grid_points, points_from_spans
-from ..device_profile import BASE_LABELS, BASES, DELAYS, DeviceProfile, import_ezcad
-from ..patterns import calibration_grid, crosshair
+from ..correction import cor_summary, fit_field_map, grid_points, points_from_spans, validate_cor
+from ..device_profile import BASE_LABELS, BASES, DELAYS, DRIVER_LABELS, DeviceProfile, import_ezcad
+from ..patterns import calibration_grid, crosshair, mark_layer
 from ..markparam import guess_kind, read_markparam
 from ..presets import Preset, starting_layer
 from ..sources import DEFAULT_SOURCE, SOURCES, parse_limits
-from ..workspace import COPPER_FILL
+from ..workspace import COPPER_FILL, Artwork, Job, rectangle
 from .panels import button, heading, hint, number, row, whole
 
 DELAY_LABELS = {
@@ -69,7 +71,7 @@ class MachineSetupDialog(QDialog):
         self.lib_path.setPlaceholderText("MarkParam.lib — EZCAD's pen library (optional): timing and your saved settings")
         self.pending_sets = ()
         box.addLayout(row(self.cfg_path, button("Browse…", lambda: self._browse(self.cfg_path, "EZCAD configuration (markcfg*);;All files (*)"))))
-        box.addLayout(row(self.cor_path, button("Browse…", lambda: self._browse(self.cor_path, "Lens correction (*.cor);;All files (*)"))))
+        box.addLayout(row(self.cor_path, button("Browse…", self.browse_cor)))
         box.addLayout(row(self.lib_path, button("Browse…", lambda: self._browse(self.lib_path, "EZCAD pen library (*.lib);;All files (*)"))))
         box.addWidget(button("Read factory files", self.import_factory, primary=True))
         self.report = QPlainTextEdit()
@@ -138,8 +140,16 @@ class MachineSetupDialog(QDialog):
         form.addRow(heading("Speeds"))
         form.addRow("Red-light frame speed", self.frame_speed)
         form.addRow("Jump speed (laser off)", self.jump_speed)
+        form.addRow(heading("Driver"))
+        self.driver = QComboBox()
+        for key, label in DRIVER_LABELS.items():
+            self.driver.addItem(label, key)
+        self.driver.setToolTip("The original program's settings are the ones known to run this machine reliably. "
+                               "The speeds and delays below are only sent with “Timing and speeds from the EZCAD files”.")
+        form.addRow("Driver settings", self.driver)
         form.addRow(heading("Controller delays"))
-        form.addRow(hint("Leave at defaults unless line starts or corners look burnt or bent."))
+        form.addRow(hint("Used only with “Timing and speeds from the EZCAD files”. Try that setting with "
+                         "Machine → Connection Test first."))
         self.delays = {}
         for key, label in DELAY_LABELS.items():
             low = -32767 if key in ("delay_laser_on", "delay_laser_off") else 0
@@ -179,6 +189,31 @@ class MachineSetupDialog(QDialog):
         if path:
             target.setText(path)
 
+    def browse_cor(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Lens correction file", self.cor_path.text(),
+                                              "Lens correction (*.cor);;All files (*)")
+        if path:
+            self.cor_path.setText(path)
+            self.attach_cor(Path(path))
+
+    def attach_cor(self, path: Path) -> bool:
+        """Store a .cor table in the profile now, without needing markcfg7 or Read factory files."""
+        try:
+            profile, text = with_cor(self.collect_lenient(), path)
+        except Exception as exc:
+            self.report.setPlainText(f"{path.name} could not be used: {exc}")
+            return False
+        self.profile = profile
+        self.report.setPlainText(text + "\nChoose it as the lens correction in Machine → Calibrate Lens. Save to keep it.")
+        self._status()
+        return True
+
+    def collect_lenient(self) -> DeviceProfile:
+        try:
+            return self.collect()
+        except ValueError:
+            return self.profile
+
     def load(self, profile: DeviceProfile):
         self.profile = profile
         self.name.setText(profile.name if profile.name != "Offline preview" else "ComMarker B6 MOPA")
@@ -200,6 +235,7 @@ class MachineSetupDialog(QDialog):
         self.red_y.setValue(profile.red_y)
         self.red_sx.setValue(profile.red_scale_x)
         self.red_sy.setValue(profile.red_scale_y)
+        self.driver.setCurrentIndex(max(0, self.driver.findData(profile.driver)))
         self.enabled.setChecked(profile.enabled)
         self._status()
 
@@ -269,7 +305,7 @@ class MachineSetupDialog(QDialog):
             invert_y=self.invert_y.isChecked(), frame_speed=self.frame_speed.value(),
             jump_speed=self.jump_speed.value(), delays={key: box.value() for key, box in self.delays.items()},
             red_x=self.red_x.value(), red_y=self.red_y.value(), red_scale_x=self.red_sx.value(),
-            red_scale_y=self.red_sy.value(), enabled=self.enabled.isChecked(),
+            red_scale_y=self.red_sy.value(), enabled=self.enabled.isChecked(), driver=self.driver.currentData(),
         )
         if profile.min_hz > profile.max_hz:
             raise ValueError("The lowest frequency is above the highest")
@@ -288,6 +324,10 @@ class MachineSetupDialog(QDialog):
             self.status.setText("Complete and enabled.")
 
     def save(self):
+        # A .cor file chosen by typing its path (or before Read factory files) is still stored.
+        cor = self.cor_path.text().strip()
+        if cor and Path(cor).name != self.profile.correction_name and not self.attach_cor(Path(cor)):
+            return
         try:
             profile = self.collect()
             profile.validate(live=profile.enabled)
@@ -358,13 +398,44 @@ class CalibrationDialog(QDialog):
         self.resize(560, 700)
         self.controller = controller
         self.fit = None
+        self._tracing = False
         self.red_points: dict[str, list[float]] = {}
         self.red_aim = ""
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
+        tabs = self.tabs = QTabWidget()
         layout.addWidget(tabs, 1)
 
-        # ---- 1 Mark
+        # ---- Quick size: one square, measure, adjust, repeat
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.addWidget(hint(
+            "The quick way to get sizes right: trace or mark a square, measure it with calipers, enter what you "
+            "measured, and adjust. Repeat until it measures the size you asked for. It corrects scale only; "
+            "the grid tabs also correct bowing towards the edges."))
+        form = QFormLayout()
+        self.square = number(20, 1, 150, 2, "mm", 1)
+        self.square.setToolTip("Side length of the test square, drawn at the centre of the field")
+        form.addRow("Square size", self.square)
+        box.addLayout(form)
+        self.trace = button("Trace square with red light", self.trace_square,
+                            tip="Quick, but only as accurate as the red light's own alignment (tab 4)")
+        box.addLayout(row(self.trace, button("Add square to job list", self.add_square,
+                                             tip="Mark it for the most accurate measurement")))
+        form = QFormLayout()
+        self.measured_x = number(20, 0.1, 500, 3, "mm", 0.01)
+        self.measured_y = number(20, 0.1, 500, 3, "mm", 0.01)
+        form.addRow("Measured width (X, left ↔ right)", self.measured_x)
+        form.addRow("Measured height (Y, front ↕ back)", self.measured_y)
+        box.addLayout(form)
+        self.square.valueChanged.connect(self._square_changed)
+        box.addLayout(row(button("Adjust size", self.adjust_size, primary=True),
+                          button("Reset size trim", self.reset_trim), stretch=True))
+        self.trim_status = hint()
+        box.addWidget(self.trim_status)
+        box.addStretch(1)
+        tabs.addTab(page, "1 · Quick size")
+
+        # ---- Grid: mark
         page = QWidget()
         box = QVBoxLayout(page)
         box.addWidget(heading("Lens correction to start from"))
@@ -375,6 +446,11 @@ class CalibrationDialog(QDialog):
         box.addWidget(self.base)
         self.base_hint = hint()
         box.addWidget(self.base_hint)
+        self.cor_reverse = QCheckBox("Reverse the .cor table's direction")
+        self.cor_reverse.setToolTip("Mark the grid with the .cor table. If the outer crosses land further from "
+                                    "their places than with no correction, tick this and mark it again.")
+        self.cor_reverse.toggled.connect(self._cor_reverse_toggled)
+        box.addWidget(self.cor_reverse)
         box.addWidget(heading("Mark a grid"))
         box.addWidget(hint(
             "Focus on a flat piece of card, painted metal or anodised aluminium. Add the grid, arm and run it "
@@ -395,7 +471,7 @@ class CalibrationDialog(QDialog):
         self.current = hint()
         box.addWidget(self.current)
         box.addWidget(button("Remove the measured calibration", self.clear_calibration))
-        tabs.addTab(page, "1 · Mark")
+        tabs.addTab(page, "2 · Grid: mark")
 
         # ---- 2 Measure
         page = QWidget()
@@ -432,7 +508,7 @@ class CalibrationDialog(QDialog):
         self.apply.setEnabled(False)
         box.addWidget(self.apply)
         box.addWidget(hint("Afterwards, mark the grid again and re-measure to confirm. Repeating refines it."))
-        tabs.addTab(page, "2 · Measure")
+        tabs.addTab(page, "3 · Grid: measure")
 
         # ---- 3 Red light
         page = QWidget()
@@ -464,7 +540,7 @@ class CalibrationDialog(QDialog):
         self.red_save = button("Save red-light alignment", self.save_red, primary=True)
         box.addWidget(self.red_save)
         box.addStretch(1)
-        tabs.addTab(page, "3 · Red light")
+        tabs.addTab(page, "4 · Red light")
 
         layout.addWidget(button("Close", self.close))
         controller.profile_changed.connect(self.refresh)
@@ -478,10 +554,16 @@ class CalibrationDialog(QDialog):
         self.base.blockSignals(True)
         self.base.setCurrentIndex(self.base.findData(profile.base))
         self.base.blockSignals(False)
+        self.cor_reverse.blockSignals(True)
+        self.cor_reverse.setChecked(profile.cor_sign < 0)
+        self.cor_reverse.blockSignals(False)
+        self.cor_reverse.setVisible(profile.base == "cor" and bool(profile.correction))
         self.span.setMaximum(min(profile.width, profile.height))
+        stored = f" ({profile.correction_name})" if profile.correction_name else ""
         notes = {
-            "cor": "The factory .cor table is uploaded to the controller." if profile.correction else
-                   "No .cor file is stored in the profile. Load it in Machine Setup first.",
+            "cor": f"StudioLaser applies the factory .cor table{stored} to every point it sends. The controller "
+                   "itself gets a blank table, as with the original program. Confirm it once by marking the grid."
+                   if profile.correction else "No .cor file is stored yet. Choose this option again to load one.",
             "ezcad": "Uses EZCAD's bulge, skew and trapezoid numbers from markcfg7. EZCAD's formula is not "
                      "published, so this is an approximation: measure before trusting it.",
             "none": "No correction. Lines will bow towards the edges of the field until you calibrate.",
@@ -490,22 +572,113 @@ class CalibrationDialog(QDialog):
                                "and keep the one whose spans measure closest to the grid size.")
         self.current.setText(f"Measured calibration: {profile.calibration_note}" if profile.calibration
                              else "No measured calibration is applied yet.")
+        self._trim_status()
         self._red_status()
+
+    def _cor_reverse_toggled(self, checked):
+        profile = self.controller.profile
+        sign = -1 if checked else 1
+        if sign == profile.cor_sign:
+            return
+        if self.controller.busy:
+            QMessageBox.information(self, "Calibrate Lens", "Stop the laser (or the red-light frame) first.")
+        elif self.controller.set_profile(replace(profile, cor_sign=sign, calibration=None, calibration_note="",
+                                                 trim_x=1.0, trim_y=1.0)):
+            self.controller.say("The .cor table's direction was reversed; the measured calibration and size trim "
+                                "were cleared. Mark the grid again.", "warning")
+        self.refresh()
 
     def _base_changed(self):
         profile = self.controller.profile
         base = self.base.currentData()
         if base == profile.base:
             return
-        if base == "cor" and not profile.correction:
-            QMessageBox.information(self, "Calibrate Lens", "Load the lens .cor file in Machine Setup first.")
+        if self.controller.busy:
+            QMessageBox.information(self, "Calibrate Lens", "Stop the laser (or the red-light frame) first.")
             self.refresh()
             return
-        # A measured calibration belongs to the correction it was measured on top of.
-        if self.controller.set_profile(replace(profile, base=base, calibration=None, calibration_note="")):
-            self.controller.say(f"Lens correction base: {BASE_LABELS[base]}. Any measured calibration was cleared; "
-                                "mark and measure a grid again.", "warning")
+        if base == "cor" and not profile.correction:
+            path, _ = QFileDialog.getOpenFileName(self, "Factory lens correction file", "",
+                                                  "Lens correction (*.cor);;All files (*)")
+            if not path:
+                self.refresh()
+                return
+            try:
+                profile, text = with_cor(profile, Path(path))
+            except Exception as exc:
+                QMessageBox.warning(self, "Calibrate Lens", f"{Path(path).name} could not be used: {exc}")
+                self.refresh()
+                return
+            self.controller.say(text)
+        # A measured calibration (and size trim) belongs to the correction it was measured on top of.
+        if self.controller.set_profile(replace(profile, base=base, calibration=None, calibration_note="",
+                                               trim_x=1.0, trim_y=1.0)):
+            self.controller.say(f"Lens correction base: {BASE_LABELS[base]}. Any measured calibration and size trim "
+                                "were cleared; check the size again.", "warning")
         self.refresh()
+
+    # ---- quick size
+
+    def square_paths(self):
+        half = self.square.value() / 2
+        return (rectangle(-half, -half, half, half),)
+
+    def _square_changed(self):
+        self.measured_x.setValue(self.square.value())
+        self.measured_y.setValue(self.square.value())
+        if self._tracing and self.controller.target:
+            self.controller.show_target(self.square_paths())
+
+    def trace_square(self):
+        self._tracing = True
+        c = self.controller
+        if c.target == self.square_paths() and not c.framing:
+            c.target = None          # same square, but its frame was stopped: start it again
+        c.show_target(self.square_paths())
+        reason = self.controller.blockers()["frame"] if not self.controller.framing else ""
+        if reason:
+            self.controller.say(f"Red light is off: {reason}", "warning")
+
+    def add_square(self):
+        size = self.square.value()
+        path = rectangle(-size / 2, -size / 2, size / 2, size / 2)
+        layer = mark_layer("Size check")
+        self.controller.add_jobs([Job(f"Size check square {size:g} mm", (Artwork("Square", (path,), (), layer),),
+                                      job_id=uuid4().hex)])
+        self.controller.say("Size check square added. Set a power that just marks, then arm and run it.", "success")
+
+    def adjust_size(self):
+        profile = self.controller.profile
+        try:
+            updated = profile.with_trim(self.square.value(), self.measured_x.value(), self.measured_y.value())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Quick size", str(exc))
+            return
+        if self.controller.marking:
+            QMessageBox.information(self, "Quick size", "Wait for the engraving to finish.")
+            return
+        if self.controller.set_profile(updated, while_framing=True):
+            self.controller.say(f"Size trim now X {updated.trim_x * 100:.3f} %, Y {updated.trim_y * 100:.3f} %. "
+                                "Trace or mark the square again and re-measure.", "success")
+            self.measured_x.setValue(self.square.value())
+            self.measured_y.setValue(self.square.value())
+        self._trim_status()
+
+    def reset_trim(self):
+        profile = self.controller.profile
+        if (profile.trim_x, profile.trim_y) != (1.0, 1.0):
+            if self.controller.set_profile(replace(profile, trim_x=1.0, trim_y=1.0), while_framing=True):
+                self.controller.say("Size trim reset.", "warning")
+        self._trim_status()
+
+    def _trim_status(self):
+        profile = self.controller.profile
+        if (profile.trim_x, profile.trim_y) == (1.0, 1.0):
+            text = "No size trim applied."
+        else:
+            text = f"Size trim: X {profile.trim_x * 100:.3f} %, Y {profile.trim_y * 100:.3f} %."
+        self.trim_status.setText(text + f"\nLens correction: {BASE_LABELS[profile.base]}"
+                                 + (" (change it on the Grid: mark tab)." if profile.base != "cor" else "."))
 
     def targets(self):
         return grid_points(self.span.value(), self.count.currentData())
@@ -566,8 +739,8 @@ class CalibrationDialog(QDialog):
         targets = self.targets()
         try:
             measured = self.measured()
-            # What was commanded for each target when the grid was marked: the calibration active now.
-            commanded = [profile.calibration.apply(t) if profile.calibration else t for t in targets]
+            # What was commanded for each target when the grid was marked: the calibration and trim active now.
+            commanded = [profile.calibrated(t) for t in targets]
             self.fit = fit_field_map(commanded, measured, targets, profile.half)
         except ValueError as exc:
             self.fit = None
@@ -600,13 +773,14 @@ class CalibrationDialog(QDialog):
             self.result.setText("Saved. Mark the grid again to confirm; the spans should now match the grid size.")
 
     def clear_calibration(self):
-        if self.controller.profile.calibration and self.controller.set_profile(
-                self.controller.profile.with_calibration(None)):
+        profile = self.controller.profile
+        if profile.calibration and self.controller.set_profile(replace(profile, calibration=None, calibration_note="")):
             self.controller.say("Measured lens calibration removed.", "warning")
 
     # ---- red light
 
     def aim(self, which: str):
+        self._tracing = False
         half = self.span.value() / 2
         self.red_aim = which
         self.red_points.setdefault(which, [0.0, 0.0] if which == "centre" else [half, half])
@@ -688,5 +862,19 @@ class CalibrationDialog(QDialog):
         self._red_status()
 
     def closeEvent(self, event):
+        self._tracing = False
         self.controller.clear_target()
         super().closeEvent(event)
+
+
+def with_cor(profile: DeviceProfile, path: Path) -> tuple[DeviceProfile, str]:
+    """``profile`` holding the .cor table read from ``path``, and a line describing it."""
+    data = path.read_bytes()
+    validate_cor(data)
+    summary = cor_summary(data)
+    text = (f"Lens correction file {path.name}: valid 65 × 65 table"
+            + (f", written for a {summary['field_mm']:.1f} mm field" if summary["field_mm"] else "") + ".")
+    if summary["field_mm"] and abs(summary["field_mm"] - profile.width) > 0.5:
+        text += (f" The profile's field is {profile.width:g} mm; set the field size to match the lens the file "
+                 "was made for.")
+    return replace(profile, correction=b64encode(data).decode("ascii"), correction_name=path.name), text

@@ -19,82 +19,54 @@ from tests.test_calibration_and_model import b6_profile  # noqa: E402
 from tests.test_gui import app, board_side, controller, pump  # noqa: E402,F401
 
 
-class FlakyGalvo:
-    """A controller whose abort fails once, as a single lost USB reply would."""
+def test_failed_stop_reports_unknown_and_sends_nothing_after_the_fault(monkeypatch):
+    from galvo.consts import StopExecute
+    from mopa_luiz.live import SimulatedDevice
 
-    light_pin, laser_pin = 8, 0
-    is_connected = True
-
-    def __init__(self):
-        self.log = []
-        self._sending = True
-        self.connection = type("Connection", (), {})()
-
-    def send(self, data, read=True):
-        return (0, 0, 0, 0)
-
-    def status(self):
-        return 0x20
-
-    def lighting_configuration(self):
-        pass
-
-    def dark(self, x, y):
-        pass
-
-    def light(self, x, y):
-        pass
-
-    def light_off(self):
-        pass
-
-    def initial_configuration(self):
-        pass
-
-    def is_ready_and_not_busy(self):
-        return True
-
-    def is_ready(self):
-        return True
-
-    def is_busy(self):
-        return False
-
-    def abort(self, dummy_packet=True):
-        self.log.append("abort")
-        raise ConnectionError("The galvo did not acknowledge a USB operation")
-
-    def port_off(self, bit):
-        self.log.append(f"port_off({bit})")
-
-    def write_port(self):
-        self.log.append("write_port")
-
-    def shutdown(self):
-        self.log.append("shutdown")
-
-
-def test_failed_abort_still_turns_the_lights_off_and_reports_unknown(monkeypatch):
     monkeypatch.setenv("OPENMOPA_MOCK", "1")
-    fake = FlakyGalvo()
-    monkeypatch.setattr(dh, "connect_controller", lambda *args, **kwargs: fake)
+
+    class FlakyStop(SimulatedDevice):
+        def __init__(self):
+            self.stop_failed = False
+
+        def write(self, endpoint, data, timeout):
+            assert not self.stop_failed, "wrote again after a failed transfer"
+            return super().write(endpoint, data, timeout)
+
+        def read(self, endpoint, size, timeout):
+            if self.command == StopExecute:
+                self.stop_failed = True
+                raise OSError("Lost Stop acknowledgement")
+            return super().read(endpoint, size, timeout)
+
+    fake = FlakyStop()
+    monkeypatch.setattr(dh, "SimulatedDevice", lambda: fake)
     commands_in, commands_out = mp.Pipe(duplex=False)
     results_in, results_out = mp.Pipe(duplex=False)
     worker = threading.Thread(target=dh.hardware_operation,
                               args=(commands_in, "frame-loop", b6_profile(), (((1, 1), (2, 2)),), results_out))
     worker.start()
-    time.sleep(0.4)
-    commands_out.send(("abort", None))
-    worker.join(5)
-    events = []
     try:
-        while results_in.poll():
-            events.append(results_in.recv())
-    except (EOFError, OSError):
-        pass                                    # the worker closes its end when it is done
-    assert "port_off(8)" in fake.log and "write_port" in fake.log and fake.log[-1] == "shutdown"
-    assert events[-1][0] == "unknown"
-
+        while results_in.poll(5):
+            if results_in.recv()[0] == "running":
+                break
+        else:
+            pytest.fail("Frame did not start")
+        commands_out.send(("abort", None))
+        worker.join(5)
+        events = []
+        try:
+            while results_in.poll():
+                events.append(results_in.recv())
+        except (EOFError, OSError):
+            pass
+        assert fake.stop_failed
+        assert events[-1][0] == "unknown"
+        assert "Lost Stop acknowledgement" in events[-1][1]
+    finally:
+        commands_out.close()
+        results_in.close()
+        worker.join(5)
 
 def test_bottom_side_cannot_be_ticked_early_and_auto_placement_clears_a_tick(app, tmp_path, monkeypatch):
     c = controller(tmp_path, monkeypatch, [board_side("top"), board_side("bottom")])

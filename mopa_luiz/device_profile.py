@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .cli import MarkConfig, load_markcfg
-from .correction import EzcadField, FieldMap, cor_summary, validate_cor
+from .correction import CorTable, EzcadField, FieldMap, cor_summary, validate_cor
 from .sources import DEFAULT_SOURCE, SOURCES, Limits, parse_limits
 
 DELAYS = {
@@ -28,6 +28,12 @@ BASE_LABELS = {
     "none": "No lens correction",
 }
 VERSION = 2
+TRIM_LIMITS = (0.8, 1.25)
+# How galvoplotter is driven. "original" uses exactly the settings of the original program, which ran this
+# machine reliably; "ezcad" also sends the timing and speeds read from markcfg7 / MarkParam.lib.
+DRIVERS = ("original", "ezcad")
+DRIVER_LABELS = {"original": "Original program's settings (recommended)",
+                 "ezcad": "Timing and speeds from the EZCAD files"}
 
 
 def write_json(path: Path, data) -> None:
@@ -64,12 +70,20 @@ class DeviceProfile:
     frame_speed: float = 3000
     jump_speed: float = 3000
     correction: str = ""
+    correction_name: str = ""     # file the .cor table came from, for display only
     base: str = "none"
     ezcad: EzcadField = EzcadField()
     calibration: FieldMap | None = None
     calibration_note: str = ""
     delays: dict[str, float] = field(default_factory=dict)
     enabled: bool = False
+    # Size trim from the quick square check: scales X and Y about the field centre, on top of the
+    # measured calibration. A full grid calibration folds it in and resets it to 1.
+    trim_x: float = 1.0
+    trim_y: float = 1.0
+    # +1 adds the .cor table's offsets the way the controller board does; -1 reverses them.
+    cor_sign: int = 1
+    driver: str = "original"
 
     @property
     def pulse_widths(self) -> tuple[int, ...]:
@@ -108,10 +122,14 @@ class DeviceProfile:
             raise ValueError("Field sizes, frame scales and speeds must be finite and positive")
         if not all(math.isfinite(v) for v in (self.red_x, self.red_y)):
             raise ValueError("Red-light offsets must be finite")
+        if not all(math.isfinite(v) and TRIM_LIMITS[0] <= v <= TRIM_LIMITS[1] for v in (self.trim_x, self.trim_y)):
+            raise ValueError(f"Size trim must be between {TRIM_LIMITS[0]:g} and {TRIM_LIMITS[1]:g}")
         if self.frame_speed > 15000 or self.jump_speed > 15000:
             raise ValueError("Frame and jump speeds must not exceed 15000 mm/s")
         if self.base not in BASES:
             raise ValueError("Unknown lens correction base")
+        if self.driver not in DRIVERS or self.cor_sign not in (1, -1):
+            raise ValueError("Unknown driver setting or .cor direction")
         # EZCAD uses a negative laser-on delay (the laser starts before the mirrors settle); the
         # controller encodes the sign, so on/off delays may be negative and the others may not.
         signed = {"delay_laser_on", "delay_laser_off"}
@@ -139,27 +157,42 @@ class DeviceProfile:
         })
 
     @cached_property
-    def _maps(self) -> tuple[FieldMap, ...]:
-        maps = []
-        if self.calibration is not None and not self.calibration.identity:
-            maps.append(self.calibration)
+    def _calibration_map(self) -> FieldMap | None:
+        return self.calibration if self.calibration is not None and not self.calibration.identity else None
+
+    @cached_property
+    def _base_map(self) -> FieldMap | None:
         base = self.ezcad.field_map(self.half, distortion=self.base == "ezcad")
-        if not base.identity:
-            maps.append(base)
-        return tuple(maps)
+        return None if base.identity else base
+
+    @cached_property
+    def _cor_table(self) -> CorTable | None:
+        """The factory table, applied here: the board itself always gets a blank one."""
+        if self.base != "cor" or not self.correction:
+            return None
+        table = CorTable(b64decode(self.correction), self.cor_sign)
+        return None if table.identity else table
 
     @property
     def curved(self) -> bool:
         """True when straight lines must be subdivided to follow the correction."""
-        return bool(self._maps)
+        return self._calibration_map is not None or self._base_map is not None or self._cor_table is not None
+
+    def calibrated(self, point):
+        """Target mm after the measured calibration and the size trim: what a grid fit is relative to."""
+        x, y = point
+        if self._calibration_map is not None:
+            x, y = self._calibration_map.apply((x, y))
+        return x * self.trim_x, y * self.trim_y
 
     def command_point(self, point, *, red_light=False):
         """Target mm -> the mm position to command, after software correction."""
         x, y = point
         if not (abs(x) <= self.width / 2 + 1e-6 and abs(y) <= self.height / 2 + 1e-6):
             raise ValueError(f"Point ({x:.2f}, {y:.2f}) mm lies outside the {self.width:g} × {self.height:g} mm field")
-        for field_map in self._maps:
-            x, y = field_map.apply((x, y))
+        x, y = self.calibrated((x, y))
+        if self._base_map is not None:
+            x, y = self._base_map.apply((x, y))
         if red_light:
             x, y = x * self.red_scale_x + self.red_x, y * self.red_scale_y + self.red_y
         return x, y
@@ -173,10 +206,28 @@ class DeviceProfile:
             x, y = y, x
         x = -x if self.invert_x else x
         y = -y if self.invert_y else y
-        return round((min(0.5, max(-0.5, x)) + 0.5) * 65535), round((min(0.5, max(-0.5, y)) + 0.5) * 65535)
+        gx, gy = (min(0.5, max(-0.5, x)) + 0.5) * 65535, (min(0.5, max(-0.5, y)) + 0.5) * 65535
+        if self._cor_table is not None:
+            # The table works in the controller's own coordinates, after any axis swap or reversal.
+            gx, gy = self._cor_table.apply(gx, gy)
+            if not (-0.5 <= gx <= 65535.5 and -0.5 <= gy <= 65535.5):
+                raise ValueError(f"Point ({point[0]:.2f}, {point[1]:.2f}) mm needs galvo travel beyond the field "
+                                 "after the lens correction")
+        return min(65535, max(0, round(gx))), min(65535, max(0, round(gy)))
 
     def with_calibration(self, field_map: FieldMap | None, note: str = "") -> "DeviceProfile":
-        return replace(self, calibration=field_map, calibration_note=note)
+        """A grid fit is measured relative to calibration and trim together, so it replaces both."""
+        return replace(self, calibration=field_map, calibration_note=note, trim_x=1.0, trim_y=1.0)
+
+    def with_trim(self, target: float, measured_x: float, measured_y: float) -> "DeviceProfile":
+        """Scale so a square drawn ``target`` mm wide, which came out ``measured`` mm, comes out true."""
+        if not all(math.isfinite(v) and v > 0 for v in (target, measured_x, measured_y)):
+            raise ValueError("Enter the square's size and both measurements in millimetres")
+        trim_x, trim_y = self.trim_x * target / measured_x, self.trim_y * target / measured_y
+        if not all(TRIM_LIMITS[0] <= v <= TRIM_LIMITS[1] for v in (trim_x, trim_y)):
+            raise ValueError(f"That is a {max(abs(trim_x - 1), abs(trim_y - 1)) * 100:.0f} % correction. Check the "
+                             "measurement and that the square was marked at the size entered here.")
+        return replace(self, trim_x=round(trim_x, 6), trim_y=round(trim_y, 6))
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -287,7 +338,7 @@ def import_ezcad(config: Path, correction: Path | None = None, *,
         red_x=cfg.get_float("REDLIGHTOFFSETX", 0.0) + 0.0, red_y=cfg.get_float("REDLIGHTOFFSETY", 0.0) + 0.0,
         red_scale_x=cfg.get_float("REDLIGHTSCALE", 1.0), red_scale_y=cfg.get_float("REDLIGHTSCALEY", 1.0),
         frame_speed=min(cfg.get_float("REDLIGHTSPEED", 3000), 15000),
-        correction=cor_text, base=base, ezcad=ezcad,
+        correction=cor_text, correction_name=correction.name if correction is not None else "", base=base, ezcad=ezcad,
         delays={dest: cfg.get_float(key) for key, dest in DELAYS.items() if key in values},
     )
     profile.validate()

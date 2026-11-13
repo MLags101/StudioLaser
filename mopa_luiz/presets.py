@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .device_profile import write_json
-from .layers import LayerSpec, RASTER_ENGRAVE, VECTOR_ENGRAVE, layer_from_dict
+from .layers import HATCH_PATTERNS, LayerSpec, RASTER_ENGRAVE, VECTOR_ENGRAVE, layer_from_dict
 from .workspace import CLEANUP, COPPER_CONTOUR, COPPER_FILL, KIND_LABELS, KINDS, MASK, SILK
 
 VERSION = 2
@@ -57,8 +57,7 @@ def layer_summary(layer: LayerSpec) -> str:
             f"{layer.pulse_width_ns:g} ns")
     if layer.operation == RASTER_ENGRAVE:
         text += f" · {layer.raster_pitch_mm:g} mm hatch"
-        if layer.crosshatch:
-            text += " ×"
+        text += f" · {HATCH_PATTERNS.get(layer.pattern, layer.pattern)}"
     return text + f" · {layer.passes}×"
 
 
@@ -131,7 +130,7 @@ class PresetLibrary:
         """Layer per kind for a freshly imported board: the user's default, else the built-in."""
         chosen = {}
         for kind in KINDS:
-            preset = next((p for p in self.user if p.kind == kind and p.default), None)
+            preset = next((p for p in self.user if p.kind == kind and p.default and p.layer.pattern != "radial"), None)
             if preset is not None:
                 chosen[kind] = replace(preset.layer)
         return chosen
@@ -182,6 +181,8 @@ def validate_preset(preset: Preset) -> None:
         raise ValueError("Give the preset a name")
     if preset.kind not in ("", *KINDS):
         raise ValueError("Unknown preset operation")
+    if preset.default and preset.layer.pattern == "radial":
+        raise ValueError("Radial spokes are a coupon pattern and cannot be a board default")
     if not 0 <= preset.kerf_mm <= 1 or not 0 <= preset.copper_um <= 1000:
         raise ValueError("Kerf must be 0–1 mm and copper thickness 0–1000 µm")
 

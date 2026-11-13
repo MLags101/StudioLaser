@@ -119,28 +119,26 @@ def run_command(args: list[str]) -> tuple[int, str]:
     return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
 
 
-def pyusb_probe() -> dict[str, Any]:
+def usb_candidates():
+    """Return the actual PyUSB devices and the backend status."""
     if importlib.util.find_spec("usb") is None:
-        return {
-            "available": False,
-            "devices": [],
-            "note": "pyusb is not installed for this Python.",
-        }
+        return [], {"available": False, "note": "pyusb is not installed for this Python."}
     import usb.core  # type: ignore[import-not-found]
 
     from .usb_backend import ensure_libusb_backend
 
     libusb = ensure_libusb_backend()
     if not libusb["available"]:
-        return {"available": False, "devices": [], "libusb": libusb, "note": libusb["note"]}
+        return [], libusb
     devices = list(
         usb.core.find(idVendor=JCZ_VENDOR_ID, idProduct=JCZ_PRODUCT_ID, find_all=True)
     )
-    return {
-        "available": True,
-        "libusb": libusb,
-        "devices": [describe_usb(dev) for dev in devices],
-    }
+    return devices, libusb
+
+
+def pyusb_probe() -> dict[str, Any]:
+    devices, libusb = usb_candidates()
+    return {**libusb, "libusb": libusb, "devices": [describe_usb(dev) for dev in devices]}
 
 
 def usb_port(dev) -> str:

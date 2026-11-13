@@ -62,6 +62,43 @@ def validate_cor(data: bytes) -> None:
     read_cor(data)
 
 
+class CorTable:
+    """A factory .cor table applied in software, the way the controller board would apply it.
+
+    The board adds the table's offset to every galvo position it is sent. The 65 x 65 nodes are
+    1024 galvo units apart; the inner index runs along galvo X and the outer along galvo Y (in
+    jcz15.cor the X offsets vary only with the inner index and the Y offsets with the outer one).
+    Applying it here, instead of uploading it, keeps the USB conversation identical to the original
+    program's, which only ever sent a blank table.
+    """
+
+    STEP = 65536 / (GRID - 1)
+
+    def __init__(self, data: bytes, sign: int = 1):
+        _, table = read_cor(data)
+        self.sign = 1 if sign >= 0 else -1
+        self.dx = [[float(table[j * GRID + k][0]) for k in range(GRID)] for j in range(GRID)]
+        self.dy = [[float(table[j * GRID + k][1]) for k in range(GRID)] for j in range(GRID)]
+        self.identity = not any(dx or dy for dx, dy in table)
+
+    def offset(self, gx: float, gy: float) -> tuple[float, float]:
+        """Bilinearly interpolated (dx, dy) in galvo units at galvo position (gx, gy), 0..65535."""
+        u = min(max(gx / self.STEP, 0.0), GRID - 1.0)
+        v = min(max(gy / self.STEP, 0.0), GRID - 1.0)
+        k, j = min(int(u), GRID - 2), min(int(v), GRID - 2)
+        fu, fv = u - k, v - j
+
+        def blend(grid):
+            return ((grid[j][k] * (1 - fu) + grid[j][k + 1] * fu) * (1 - fv)
+                    + (grid[j + 1][k] * (1 - fu) + grid[j + 1][k + 1] * fu) * fv)
+
+        return self.sign * blend(self.dx), self.sign * blend(self.dy)
+
+    def apply(self, gx: float, gy: float) -> tuple[float, float]:
+        dx, dy = self.offset(gx, gy)
+        return gx + dx, gy + dy
+
+
 def cor_summary(data: bytes) -> dict[str, float]:
     """Numbers an operator can sanity-check against the lens."""
     scale, table = read_cor(data)

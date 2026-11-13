@@ -87,9 +87,10 @@ python -m pytest tests -q
   then `sudo udevadm control --reload-rules && sudo udevadm trigger`, and replug the laser.
 - **macOS:** nothing to do.
 
-The status chip at the top right of the window shows **Laser connected**,
-**Wrong USB driver**, **Choose a laser** or **Laser offline**; hover it for the
-reason. Click it to choose which laser to use when more than one is plugged in.
+The status chip at the top right shows **Laser detected** when the USB device is
+visible. It shows **Controller responding** during an operation after the board
+answers the handshake. Hover the chip for details or click it to choose a laser
+when more than one is plugged in.
 Each laser is listed by its USB bus and port, and the choice is remembered as
 long as that laser stays in the same USB socket. If the chosen laser is
 unplugged, StudioLaser refuses to run rather than switch to another one.
@@ -163,6 +164,13 @@ and 35 µm copper on FR4. They come from vendor and community figures (see
 [docs/reference/SOURCES.md](docs/reference/SOURCES.md)), not from measurements
 on your machine. Tune them on scrap of your laminate:
 
+- **Tools → Tune a PCB Preset** makes one coupon at a time for trace isolation,
+  silkscreen or solder mask removal. Start from a saved or imported preset,
+  frame and run the coupon on matching scrap, then review its result. The tuner
+  holds frequency at 37 kHz and suggests one change at a time. Verify trace
+  isolation with a meter. Use the Settings panel to choose parallel lines,
+  crosshatch or contour offsets for production fills. Radial spokes are available
+  on round test coupons.
 - **Tools → Material Test Matrix** engraves a labelled grid that varies two
   settings. Pick the best patch, select it in the job list, and use **Save as
   preset** in the Settings panel.
@@ -175,19 +183,19 @@ on your machine. Tune them on scrap of your laminate:
   Mark one preset per operation as the default; new boards start from it, and
   its kerf becomes the default kerf compensation.
 
-The frequency warning matters on a MOPA source: each pulse width has a cut-off
-frequency. At or above it you get the set average power; below it, pulse energy
-stays at its maximum but average power drops.
+The frequency note estimates the decrease in average power below the source's
+cut-off for the selected pulse width. The note does not block engraving.
 
 ## Making a two-sided board
 
 1. **Export** copper, mask, silkscreen, outline and drill files from your CAD
    tool at 1:1 from the same origin the CNC used, **unmirrored**.
-2. **Import PCB.** Select all the files; StudioLaser detects each one's role from
-   Gerber X2 attributes or its file name, and you can correct it. Choose
-   *Isolation channels* or *Full clear*, the isolation width, the kerf
-   compensation, and which way you will flip the board.
-3. **Top side: align by framing.** Put the board under the lens and press
+2. **Import Gerber / PCB.** Confirm the detected file roles, then choose
+   **Isolate traces**, **Clear all non-trace copper**, or **Engrave drawn shapes**.
+   Set the isolation width, kerf, flip axis, and which side runs first. Review
+   the preview before adding the job. For a single positive copper layer,
+   the outline is optional. Check that the stock covers the inferred work area.
+3. **Align the first side by framing.** Put the board under the lens and press
    **Frame**. The red light traces the board outline and a small ring at every
    drilled hole, and the canvas shows the same trace as a dashed red line. Move
    the design while it runs and the red light follows:
@@ -216,8 +224,8 @@ stays at its maximum but average power drops.
 5. Tick **Side and alignment checked**, then **Preview** (toolpaths and time
    estimate), **Arm**, **Start**. Arming lasts 30 seconds and is cancelled by any
    edit; moving the board clears the tick.
-6. **Flip the board**, select the bottom side, align it the same way on the same
-   holes, and run it. The bottom side cannot be armed until the top is
+6. **Flip the board**, select the second side, align it on the same holes, and
+   run it. The second side can be armed after the first is
    complete.
 
 Plated holes and vias are a separate step; StudioLaser does not make them.

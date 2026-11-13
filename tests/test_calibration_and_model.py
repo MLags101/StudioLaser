@@ -316,7 +316,7 @@ def test_ezcad_pen_library_gives_timing_and_the_operators_sets():
     smr = sets["SMR"]
     assert (smr.passes, smr.speed_mm_s, smr.power_percent, smr.frequency_khz, smr.pulse_width_ns) == (1, 1000, 50, 40, 200)
     assert (sets["PCBEn"].power_percent, sets["PCBEn"].frequency_khz) == (97, 37)
-    assert [guess_kind(name) for name in ("SMR", "PCBClean", "PCBEn")] == ["mask", "cleanup", ""]
+    assert [guess_kind(name) for name in ("SMR", "PCBClean", "PCBEn")] == ["mask", "cleanup", "copper_fill"]
     # A negative laser-on delay is valid and survives a save.
     profile = b6_profile(delays=library.delays, jump_speed=library.jump_speed)
     profile.validate(live=True)

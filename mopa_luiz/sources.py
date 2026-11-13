@@ -1,8 +1,7 @@
 """Laser source limits: valid MOPA pulse widths and their frequency windows.
 
 A JPT MOPA source accepts only a fixed set of pulse widths. Each has a
-cut-off frequency, below which the source limits peak power so average
-power falls, and a maximum frequency.
+cut-off frequency, below which average power falls, and a maximum frequency.
 
 The 60 W table is from the JPT YDFLP-60/80/100/120-M7-M-R user manual
 (tables 4 and 5). Other wattages have different cut-offs; edit the table in
@@ -46,8 +45,8 @@ def frequency_advice(limits: Limits, pulse_width_ns: float, frequency_khz: float
     if frequency_khz < cutoff:
         share = max(1, round(100 * frequency_khz / cutoff))
         return "warning", (
-            f"Below the {cutoff:g} kHz cut-off for {pulse_width_ns:g} ns: full pulse energy, "
-            f"but average power is about {share}% of the set value"
+            f"Below the {cutoff:g} kHz cut-off for {pulse_width_ns:g} ns, estimated average power "
+            f"is about {share}% of the set value. This does not block engraving."
         )
     return "", ""
 

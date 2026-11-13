@@ -12,28 +12,34 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
+from ..artwork_files import FILE_FILTER, GERBER_SUFFIXES
 from ..patterns import test_square
 from ..presets import starting_layer
 from ..workspace import COPPER_FILL
 from . import theme
 from .canvas import Canvas
 from .controller import ARTWORK_SUFFIXES, FRAME_MODES, LINK_TEXT, AppController
+from .diagnostics import ConnectionTestDialog, copy_problem_report, open_log_folder
 from .dialogs import (
     MaterialTestDialog, PcbImportDialog, PresetManagerDialog, RegistrationDialog, SavePresetDialog, focus_job,
     kerf_ladder_job,
 )
 from .machine import CalibrationDialog, MachineSetupDialog
-from .panels import Inspector, JobsPanel, LogPanel, button
+from .tuning import TuningDialog
+from .panels import Inspector, JobsPanel, LogPanel, button, row
 
 GUIDE = """<h3>Two-sided PCB, start to finish</h3>
 <ol>
 <li><b>Machine Setup</b> (once): load <i>markcfg7</i> and the lens <i>.cor</i> file, check the source and lens, enable the profile.</li>
-<li><b>Calibrate Lens</b> (once per lens): mark a grid on card, measure it, apply. Then align the red light.</li>
+<li><b>Calibrate Lens</b> (once per lens): pick the lens correction (the factory <i>.cor</i> can be loaded right there),
+then <i>Quick size</i>: mark or trace a 20 mm square, measure it, Adjust, repeat until it is 20.00 mm. For edge-to-edge
+accuracy mark and measure a grid as well. Then align the red light.</li>
 <li><b>Material test</b> (once per laminate): run a test matrix and the kerf ladder on scrap, save the best patch as a preset and make it the default.</li>
-<li><b>Import PCB</b>: copper, mask, silkscreen, outline and drill files, exported 1:1 and unmirrored.</li>
-<li><b>Top side</b>: place the board, <b>Frame</b> and move it until the red outline and hole rings sit on the board, or <b>Register</b> on
+<li><b>Import Gerber / PCB</b>: choose a copper Gerber by itself or add mask, silkscreen, outline and drill files.
+Confirm the file roles, choose how to use the copper, and preview the work area before importing.</li>
+<li><b>First side</b>: place the board, <b>Frame</b> and move it until the red outline and hole rings sit on the board, or <b>Register</b> on
 holes or on the board edge, frame to check, tick <i>Side and alignment checked</i>, Preview, Arm, Start.</li>
-<li><b>Flip</b> the board, select the bottom side, register it on the same holes, and run it the same way.</li>
+<li><b>For two sides</b>, flip the board, select the other side, and confirm its alignment before running it.</li>
 </ol>
 <p><b>Stop</b> (or Esc) is always available. Wear eyewear rated for 1064 nm and run the fume extraction.</p>"""
 
@@ -70,6 +76,8 @@ class MainWindow(QMainWindow):
                 self.settings.setValue(key, former.value(key))
         self.registration = None
         self.calibration = None
+        self.connection_test = None
+        self.tuning = None
         self._closing = False
         c = self.controller
 
@@ -87,6 +95,13 @@ class MainWindow(QMainWindow):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(0)
         box.addWidget(self.banner)
+        self.run_hint = QLabel()
+        self.run_hint.setWordWrap(True)
+        self.run_next = button("", self.resolve_arm_blocker)
+        readiness = QWidget()
+        readiness.setLayout(row(self.run_hint, self.run_next))
+        readiness.layout().setStretch(0, 1)
+        box.addWidget(readiness)
         box.addWidget(self.canvas, 1)
         self.setCentralWidget(centre)
 
@@ -120,6 +135,7 @@ class MainWindow(QMainWindow):
 
         self.jobs.import_board.connect(self.pick_board)
         self.jobs.import_artwork.connect(self.pick_artwork)
+        self.jobs.add_file.connect(self.add_files)
         self.jobs.operation_selected.connect(self.inspector.select_operation)
         self.inspector.register_requested.connect(self.open_registration)
         self.inspector.save_preset_requested.connect(self.save_preset)
@@ -164,8 +180,11 @@ class MainWindow(QMainWindow):
         c = self.controller
         a = self._action
         self.act = {
-            "board": a("Import PCB…", self.pick_board, "Ctrl+Shift+I", "board", "Import Gerber and drill files for a board"),
-            "artwork": a("Import Artwork…", self.pick_artwork, "Ctrl+I", "import", "Import SVG, DXF or STL artwork"),
+            "board": a("Import Gerber / PCB…", self.pick_board, "Ctrl+Shift+I", "board", "Prepare a Gerber layer or PCB"),
+            "artwork": a("Import Artwork…", self.pick_artwork, "Ctrl+I", "import",
+                         "Import SVG, DXF, STL or single Gerber files as new jobs"),
+            "add_file": a("Add File to Job…", self.add_files, "Ctrl+Shift+A", None,
+                          "Add SVG, DXF or Gerber files to the selected job as extra operations"),
             "open": a("Open Project…", self.open_project, "Ctrl+O", "open"),
             "save": a("Save Project", self.save_project, "Ctrl+S", "save"),
             "save_as": a("Save Project As…", lambda: self.save_project(True), "Ctrl+Shift+S"),
@@ -189,11 +208,17 @@ class MainWindow(QMainWindow):
             "acknowledge": a("Confirm Machine Is Idle", c.acknowledge),
             "presets": a("Laser Presets…", lambda: PresetManagerDialog(c, self).exec()),
             "matrix": a("Material Test Matrix…", self.add_matrix),
+            "tune_pcb": a("Tune a PCB Preset…", self.open_tuning),
             "kerf": a("Kerf and Isolation Ladder", lambda: self.add_pattern(kerf_ladder_job(c))),
             "focus": a("Focus Test…", self.add_focus),
             "square_outline": a("Outline Test Square…", lambda: self.add_square(False)),
             "square_filled": a("Filled Test Square…", lambda: self.add_square(True)),
             "guide": a("Workflow Guide", lambda: QMessageBox.information(self, "Workflow guide", GUIDE), "F1"),
+            "conn_test": a("Connection Test…", self.open_connection_test, None, None,
+                           "Check the USB link and the controller with the red light, step by step"),
+            "logs": a("Open Log Folder", lambda: open_log_folder(c)),
+            "report": a("Copy Problem Report", lambda: copy_problem_report(c), None, None,
+                        "Copy the recent laser log and machine summary, to paste into a message"),
         }
         self.act["frame"].setCheckable(True)
         self.act["arm"].setCheckable(True)
@@ -215,11 +240,11 @@ class MainWindow(QMainWindow):
             self.frame_menu.addAction(action)
             self.frame_actions[key] = action
         for title, names in (
-            ("&File", ("board", "artwork", None, "open", "save", "save_as", None, "quit")),
+            ("&File", ("board", "artwork", "add_file", None, "open", "save", "save_as", None, "quit")),
             ("&Edit", ("undo", "redo", None, "remove")),
             ("&Job", ("preview", None, "frame_once", "frame", None, "arm", "start", "stop")),
-            ("&Machine", ("setup", "calibrate", None, "acknowledge")),
-            ("&Tools", ("presets", None, "matrix", "kerf", "focus", None, "square_outline", "square_filled")),
+            ("&Machine", ("setup", "calibrate", "conn_test", None, "acknowledge")),
+            ("&Tools", ("presets", "tune_pcb", None, "matrix", "kerf", "focus", None, "square_outline", "square_filled")),
         ):
             menu = bar.addMenu(title)
             for name in names:
@@ -238,7 +263,9 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda _=False, key=key: self.set_theme(key))
             group.addAction(action)
             view.addAction(action)
-        bar.addMenu("&Help").addAction(act["guide"])
+        help_menu = bar.addMenu("&Help")
+        for name in ("guide", None, "logs", "report"):
+            help_menu.addSeparator() if name is None else help_menu.addAction(act[name])
 
     def _build_toolbar(self):
         bar = self.addToolBar("Main")
@@ -302,11 +329,15 @@ class MainWindow(QMainWindow):
         gate("frame", "" if c.worker.action == "frame-loop" else why["frame"])
         gate("arm", "" if c.arming.active else why["arm"])
         gate("start", why["start"])
+        reason, next_action = self.arm_guidance(why["arm"])
+        self.run_hint.setText("Armed. Press Start when ready." if c.arming.active and not why["start"] else reason)
+        self.run_next.setText(next_action)
+        self.run_next.setVisible(bool(next_action) and not c.arming.active)
         busy = "Stop the laser first: Stop must stay reachable" if c.busy else ""
         for name in ("presets", "save", "save_as"):
             gate(name, why["edit"] or busy)
-        for name in ("board", "artwork", "open", "remove", "matrix", "kerf", "focus", "square_outline",
-                     "square_filled", "setup"):
+        for name in ("board", "artwork", "add_file", "open", "remove", "matrix", "kerf", "focus", "square_outline",
+                     "square_filled", "setup", "tune_pcb"):
             gate(name, why["edit"])
         act["undo"].setEnabled(bool(c.undo_stack) and not why["edit"])
         act["redo"].setEnabled(bool(c.redo_stack) and not why["edit"])
@@ -410,31 +441,66 @@ class MainWindow(QMainWindow):
         self.settings.setValue(key, str(Path(path).parent))
 
     def pick_artwork(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Import artwork", self._folder(), "Artwork (*.svg *.dxf *.stl)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Import artwork", self._folder(), FILE_FILTER)
+        if not paths:
+            return
+        self._remember(paths[0])
+        paths = [Path(path) for path in paths]
+        paths, gerbers = self.split_import_files(paths)
+        if gerbers:
+            self.import_board(gerbers)
+        if not paths:
+            return
+        together = False
+        if len(paths) > 1:
+            answer = QMessageBox.question(
+                self, "Import artwork", f"Import the {len(paths)} files as one job, with one operation per file?\n\n"
+                "Yes: one job; each file keeps its own settings and preset.\nNo: a separate job for each file.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            together = answer == QMessageBox.StandardButton.Yes
+        self.controller.import_artwork(paths, together=together)
+
+    def add_files(self):
+        job = self.controller.job
+        title = f"Add files to {job.name}" if job else "Add files as a new job"
+        paths, _ = QFileDialog.getOpenFileNames(self, title, self._folder(), FILE_FILTER)
         if paths:
             self._remember(paths[0])
-            self.controller.import_artwork([Path(path) for path in paths])
+            artwork, gerbers = self.split_import_files([Path(path) for path in paths])
+            if gerbers:
+                self.import_board(gerbers, target=job)
+            if artwork:
+                self.controller.import_artwork(artwork, into=job.job_id if job else None, together=not job)
+
+    @staticmethod
+    def split_import_files(paths):
+        fabrication = GERBER_SUFFIXES | {".drl", ".xln", ".exc", ".top", ".bot"}
+        return ([path for path in paths if path.suffix.lower() not in fabrication],
+                [path for path in paths if path.suffix.lower() in fabrication])
 
     def pick_board(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Import PCB — select all the board's Gerber and drill files", self._folder("board_folder"),
+            self, "Import Gerber / PCB", self._folder("board_folder"),
             "Fabrication files (*.gbr *.g?? *.drl *.xln *.exc *.txt *.cmp *.sol *.top *.bot);;All files (*)")
         if paths:
             self._remember(paths[0], "board_folder")
             self.import_board([Path(path) for path in paths])
 
-    def import_board(self, paths):
+    def import_board(self, paths, *, target=None):
         if not self.controller.can_edit():
             return
-        dialog = PcbImportDialog(paths, self.controller, self)
-        if dialog.exec():
-            self.controller.import_board(dialog.inputs(), **dialog.settings())
+        dialog = PcbImportDialog(paths, self.controller, self, target=target)
+        if not dialog.exec():
+            return
+        self.controller.commit_gerber_import(dialog.jobs, dialog.add_target)
 
-    def ask_size(self, path):
+    def ask_size(self, path, target=None):
         width, ok = QInputDialog.getDouble(
             self, path.name, "This SVG has no physical size.\nFinished artwork width (mm):", 25, 0.001, 10000, 3)
         if ok:
-            self.controller.import_artwork([path], width)
+            self.controller.import_artwork([path], width, into=target)
 
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open project", self._folder("project_folder"),
@@ -462,8 +528,8 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event):
         paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
         event.acceptProposedAction()
-        artwork = [path for path in paths if path.suffix.lower() in ARTWORK_SUFFIXES]
-        board = [path for path in paths if path.suffix.lower() not in ARTWORK_SUFFIXES and path.is_file()]
+        artwork, board = self.split_import_files([path for path in paths if path.is_file()])
+        artwork = [path for path in artwork if path.suffix.lower() in ARTWORK_SUFFIXES]
         # Return from the drop first, so the source window is not held while a dialog is open.
         if artwork:
             QTimer.singleShot(0, lambda: self.controller.import_artwork(artwork))
@@ -476,6 +542,13 @@ class MainWindow(QMainWindow):
         if self.controller.can_edit():
             self.controller.add_jobs([job])
             self.controller.say(f"Added “{job.name}”. Review its settings, then arm and run it on scrap.", "success")
+
+    def open_tuning(self):
+        if self.tuning is None:
+            self.tuning = TuningDialog(self.controller, self)
+        self.tuning.show()
+        self.tuning.raise_()
+        self.tuning.activateWindow()
 
     def add_matrix(self):
         dialog = MaterialTestDialog(self.controller, self)
@@ -519,6 +592,13 @@ class MainWindow(QMainWindow):
         if self.controller.can_edit():
             MachineSetupDialog(self.controller, self).exec()
 
+    def open_connection_test(self):
+        if self.connection_test is None:
+            self.connection_test = ConnectionTestDialog(self.controller, self)
+            self.connection_test.finished.connect(lambda _: setattr(self, "connection_test", None))
+        self.connection_test.show()
+        self.connection_test.raise_()
+
     def open_calibration(self):
         if not self.controller.profile.limits:
             self.controller.say("Run Machine Setup before calibrating the lens.", "warning")
@@ -531,13 +611,60 @@ class MainWindow(QMainWindow):
 
     def open_registration(self):
         job = self.controller.job
-        if job is None or not (job.references or job.boundary) or not self.controller.can_edit():
+        if (job is None or not (len(job.references) >= 2 or (job.boundary and not job.inferred))
+                or not self.controller.can_edit()):
             return
         if self.registration is not None:
             self.registration.close()
         self.registration = RegistrationDialog(self.controller, self.canvas, self)
         self.registration.finished.connect(lambda _: setattr(self, "registration", None))
         self.registration.show()
+
+    def arm_guidance(self, reason):
+        c = self.controller
+        job = c.job
+        if not reason:
+            return ("Ready to arm." if job else "Select a job.", "")
+        if not c.profile.enabled:
+            return reason, "Machine Setup"
+        if not c.online:
+            return reason, ""
+        if c.state_unknown:
+            return reason, "Confirm machine is idle" if not c.busy else ""
+        if c.framing and reason.startswith("Stop"):
+            return reason, "Stop frame"
+        if job and job.status in {"interrupted", "complete"} and not c.busy:
+            return reason, "Review job"
+        if job and c.pending_first_side(job) and reason.startswith("Complete"):
+            return reason, "Select first side"
+        if job and (job.side or job.coupon) and not c.is_verified(job) and not c.busy and (
+            reason.startswith(("Tick", "Confirm"))
+        ):
+            return reason, "Confirm alignment"
+        return reason, ""
+
+    def resolve_arm_blocker(self):
+        c = self.controller
+        _, action = self.arm_guidance(c.blockers()["arm"])
+        if action == "Select first side":
+            c.select(c.jobs.index(c.pending_first_side(c.job)))
+        elif action == "Confirm alignment":
+            job = c.job
+            message = ("Confirm the stock covers the inferred work area and the frame is aligned." if job.inferred else
+                       "Confirm the coupon is aligned on a fresh area of scrap." if job.coupon else
+                       f"Confirm the {job.side} side is facing up and the frame is aligned.")
+            if QMessageBox.question(self, "Confirm alignment", message) == QMessageBox.StandardButton.Yes:
+                c.set_verified(True)
+        elif action == "Confirm machine is idle":
+            if QMessageBox.question(self, action, "Have you inspected the machine and confirmed it is idle?"
+                                    ) == QMessageBox.StandardButton.Yes:
+                c.acknowledge()
+        elif action == "Review job":
+            c.review()
+        elif action == "Stop frame":
+            c.stop()
+        elif action == "Machine Setup":
+            self.open_setup()
 
     # ---- closing
 

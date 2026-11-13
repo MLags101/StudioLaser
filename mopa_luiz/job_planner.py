@@ -7,8 +7,8 @@ import math
 import time
 
 from .device_profile import DeviceProfile
-from .layers import LayerSpec, RASTER_ENGRAVE
-from .raster import hatch_polylines
+from .layers import HATCH_PATTERNS, LayerSpec, RASTER_ENGRAVE
+from .raster import contour_hatch, hatch_polylines, radial_hatch
 from .sources import frequency_advice
 from .workspace import Job, Paths
 
@@ -38,6 +38,7 @@ class MarkPlan:
     preview: Paths
     seconds: float = 0.0
     operations: tuple[tuple[str, float], ...] = ()   # (operation name, estimated seconds)
+    notes: tuple[str, ...] = ()
 
 
 def format_duration(seconds: float) -> str:
@@ -88,6 +89,8 @@ def layer_issues(layer: LayerSpec, profile: DeviceProfile) -> list[tuple[str, st
         issues.append(("error", "Speed is outside the range this field supports"))
     if layer.operation == RASTER_ENGRAVE and layer.raster_pitch_mm < 0.001:
         issues.append(("error", "Hatch spacing must be at least 0.001 mm"))
+    if layer.operation == RASTER_ENGRAVE and layer.pattern not in HATCH_PATTERNS:
+        issues.append(("error", "Choose a supported hatch pattern"))
     if profile.limits:
         if layer.pulse_width_ns not in profile.pulse_widths:
             issues.append(("error", f"{layer.pulse_width_ns:g} ns is not a pulse width of {profile.source or 'this source'}"))
@@ -111,7 +114,7 @@ def subdivide(path, limit=SUBDIVIDE_MM):
     return tuple(out)
 
 
-def toolpaths(artwork, job: Job) -> Paths:
+def toolpaths(artwork, job: Job, notes: list[str] | None = None) -> Paths:
     """World-space toolpaths for one operation, in marking order."""
     layer = artwork.layer
     source = artwork.fills if layer.operation == RASTER_ENGRAVE else artwork.paths
@@ -120,10 +123,19 @@ def toolpaths(artwork, job: Job) -> Paths:
         raise ValueError(f"{artwork.name}: incomplete path")
     if layer.operation != RASTER_ENGRAVE:
         return world * layer.passes
+    if layer.pattern == "contour":
+        paths, fallback = contour_hatch(world, layer.raster_pitch_mm, layer.raster_angle_deg)
+        if fallback and notes is not None:
+            notes.append(f"{artwork.name}: narrow regions use clipped parallel hatch.")
+        return tuple(tuple(path) for path in paths) * layer.passes
+    if layer.pattern == "radial":
+        if not job.coupon:
+            raise ValueError(f"{artwork.name}: radial spokes are for annular test coupons only")
+        return tuple(radial_hatch(world, layer.raster_pitch_mm)) * layer.passes
     result = hatch_polylines(
         world, angle_deg=layer.raster_angle_deg, pitch_mm=layer.raster_pitch_mm,
         passes=layer.passes, angle_step_deg=layer.raster_angle_step_deg,
-        closure_tol_mm=1e-6, crosshatch=layer.crosshatch, by_island=True,
+        closure_tol_mm=1e-6, crosshatch=layer.pattern == "crosshatch", by_island=True,
     )
     return tuple(tuple(path) for path in result.segments)
 
@@ -133,15 +145,18 @@ def compile_mark(job: Job, profile: DeviceProfile, *, live: bool = False) -> Mar
     batches = []
     preview = []
     operations = []
+    notes = []
     position = None
     for artwork in job.objects:
         layer = artwork.layer
         if not layer.emits_when_marking():
             continue
+        if job.coupon and layer.frequency_khz != 37:
+            raise ValueError(f"{artwork.name}: tuning coupons require 37 kHz")
         errors = [message for severity, message in layer_issues(layer, profile) if severity == "error"]
         if errors:
             raise ValueError(f"{artwork.name}: {errors[0]}")
-        paths = toolpaths(artwork, job)
+        paths = toolpaths(artwork, job, notes)
         if not paths:
             raise ValueError(f"{artwork.name}: no toolpaths. Check the operation, artwork and hatch spacing.")
         for path in paths:
@@ -173,7 +188,7 @@ def compile_mark(job: Job, profile: DeviceProfile, *, live: bool = False) -> Mar
     if not batches:
         raise ValueError("This job has no enabled operations. Tick at least one operation to run.")
     return MarkPlan(tuple(batches), len(preview), sum(map(len, preview)), tuple(preview),
-                    sum(seconds for _, seconds in operations), tuple(operations))
+                    sum(seconds for _, seconds in operations), tuple(operations), tuple(notes))
 
 
 def compile_frame(paths: Paths, profile: DeviceProfile) -> GalvoPaths:

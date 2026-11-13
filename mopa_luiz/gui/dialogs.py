@@ -7,15 +7,18 @@ import math
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
+    QGraphicsScene, QGraphicsView, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from ..patterns import PARAMETERS, focus_test, hole_targets, kerf_ladder, steps, test_matrix
 from ..presets import Preset, layer_summary, starting_layer
-from ..workspace import COPPER_CONTOUR, COPPER_FILL, KIND_LABELS, KINDS, fit_placement, fit_to_outline
+from ..workspace import CLEANUP, COPPER_CONTOUR, COPPER_FILL, KIND_LABELS, KINDS, fit_placement, fit_to_outline
+from . import theme
+from .canvas import painter_path
 from .panels import button, heading, hint, number, row, whole
 
 ROLE_LABELS = {
@@ -27,24 +30,31 @@ ROLE_LABELS = {
 
 
 class PcbImportDialog(QDialog):
-    """Map fabrication files to roles and choose how copper is removed."""
+    """Review the exact Gerber geometry before adding it to the workspace."""
 
-    def __init__(self, paths: list[Path], controller, parent=None):
+    def __init__(self, paths: list[Path], controller, parent=None, *, target=None):
         super().__init__(parent)
-        self.setWindowTitle("Import PCB")
-        self.resize(640, 560)
+        self.setWindowTitle("Import Gerber / PCB")
+        self.resize(730, 740)
         self.paths = paths
         self.controller = controller
+        self.jobs = None
+        self.target = target
+        self.generation = 0
+        self._reviewed = -1
+        self._pending = None
+        self._detected_roles = False
         layout = QVBoxLayout(self)
-        layout.addWidget(hint(
-            "Export every layer at 1:1 from the same origin the CNC used, unmirrored. "
-            "StudioLaser mirrors the bottom side itself."))
+        layout.addWidget(hint("Confirm the file roles and preview the removal. Use files exported at 1:1 "
+                              "from the same origin. StudioLaser mirrors the bottom side."))
         self.table = QTableWidget(len(paths), 2)
         self.table.setHorizontalHeaderLabels(["File", "Use as"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().hide()
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setMinimumHeight(110)
+        self.table.setMaximumHeight(180)
         self.roles = []
         for index, path in enumerate(paths):
             item = QTableWidgetItem(path.name)
@@ -52,52 +62,85 @@ class PcbImportDialog(QDialog):
             item.setToolTip(str(path))
             self.table.setItem(index, 0, item)
             combo = QComboBox()
+            combo.addItem("Choose a role…", "")
             for role, label in ROLE_LABELS.items():
                 combo.addItem(label, role)
-            combo.setCurrentIndex(combo.findData("other"))
             combo.setEnabled(False)
-            combo.currentIndexChanged.connect(self._check)
+            combo.currentIndexChanged.connect(self.invalidate)
             self.table.setCellWidget(index, 1, combo)
             self.roles.append(combo)
-        layout.addWidget(self.table, 1)
-        self.detecting = hint("Reading the files to detect each layer…")
-        layout.addWidget(self.detecting)
+        layout.addWidget(self.table)
 
         form = QFormLayout()
+        self.destination = QComboBox()
+        self.destination.addItem("Create a separate PCB job", False)
+        if (target is not None and target.side and target.origin is not None
+                and target.work_area and target.status == "ready"):
+            self.destination.addItem(f"Add operations to {target.name}", True)
+            self.destination.setCurrentIndex(1)
+        elif target is not None:
+            layout.addWidget(hint("To add Gerbers in place, select a ready PCB side with a saved origin and work area. "
+                                  "Reimport older boards to preserve their hole and slot exclusions."))
+        form.addRow("Destination", self.destination)
         self.mode = QComboBox()
-        self.mode.addItem("Isolation channels — fast, removes a band around each trace", "isolation")
-        self.mode.addItem("Full clear — removes all unused copper", "full")
-        form.addRow("Copper removal", self.mode)
+        self.mode.addItem("Isolate traces", "isolation")
+        self.mode.addItem("Clear all non-trace copper", "full")
+        self.mode.addItem("Engrave drawn shapes", "drawn")
+        form.addRow("Copper output", self.mode)
         self.width = number(0.25, 0.05, 5, 3, "mm", 0.05)
-        self.width.setToolTip("Width of the band removed around every trace and pad")
         form.addRow("Isolation width", self.width)
-        self.mode.currentIndexChanged.connect(lambda: self.width.setEnabled(self.mode.currentData() == "isolation"))
         self.kerf = number(controller.presets.kerf(), 0, 1, 3, "mm", 0.01)
-        self.kerf.setToolTip("Width of the line the laser actually removes. Removal areas are pulled in by half "
-                             "of it so traces keep their drawn width. Measure it with Tools → Kerf Ladder.")
         form.addRow("Kerf compensation", self.kerf)
         self.flip = QComboBox()
-        self.flip.addItem("Left ↔ right (like turning a page)", "vertical")
-        self.flip.addItem("Top ↔ bottom (towards you)", "horizontal")
-        form.addRow("You will flip the board", self.flip)
+        self.flip.addItem("Left ↔ right", "vertical")
+        self.flip.addItem("Top ↔ bottom", "horizontal")
+        form.addRow("Flip axis", self.flip)
+        self.first = QComboBox()
+        self.first.addItem("Top", "top")
+        self.first.addItem("Bottom", "bottom")
+        form.addRow("Run first", self.first)
         layout.addLayout(form)
-        self.problem = QLabel()
-        self.problem.setObjectName("issue")
-        self.problem.setProperty("level", "error")
-        self.problem.setWordWrap(True)
+
+        self.scene = QGraphicsScene(self)
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.view.setMinimumHeight(190)
+        self.view.setAccessibleName("Gerber geometry preview")
+        self.view.setBackgroundBrush(theme.color("canvas"))
+        layout.addWidget(self.view, 1)
+        self.side = QComboBox()
+        self.side.currentIndexChanged.connect(self._draw)
+        layout.addWidget(self.side)
+        layout.addWidget(hint("Green: retained copper   ·   Orange: copper removal or drawn shapes   ·   "
+                              "Frame: work area   ·   Mask and silkscreen use their operation colors"))
+        self.coverage = QCheckBox("The stock covers the inferred work area shown above")
+        self.coverage.toggled.connect(self._check)
+        self.coverage.hide()
+        layout.addWidget(self.coverage)
+        self.problem = hint("Reading layer roles…")
         layout.addWidget(self.problem)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Import")
-        self.buttons.accepted.connect(self.accept)
+        self.add_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.add_button.setText("Add to workspace")
+        self.review_button = self.buttons.addButton("Preview geometry", QDialogButtonBox.ButtonRole.ActionRole)
+        self.review_button.clicked.connect(self.review)
+        self.buttons.accepted.connect(self._commit)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-        # Role detection parses each Gerber, so it runs off the UI thread.
+        for widget in (self.mode, self.flip, self.first, self.destination):
+            widget.currentIndexChanged.connect(self.invalidate)
+        for widget in (self.width, self.kerf):
+            widget.valueChanged.connect(self.invalidate)
         self._future = controller.executor.submit(self._detect, list(paths))
         self._poll = QTimer(self)
-        self._poll.timeout.connect(self._detected)
+        self._poll.timeout.connect(self._poll_result)
         self._poll.start(60)
         self._check()
+
+    def done(self, result):
+        self._poll.stop()
+        super().done(result)
 
     @staticmethod
     def _detect(paths):
@@ -111,54 +154,141 @@ class PcbImportDialog(QDialog):
                 found.append("other")
         return found
 
-    def _detected(self):
-        if not self._future.done():
-            return
-        self._poll.stop()
-        try:
-            found = self._future.result()
-        except Exception:
-            found = ["other"] * len(self.paths)
-        for combo, role in zip(self.roles, found):
-            index = combo.findData(role)
-            combo.setCurrentIndex(index if index >= 0 else combo.findData("other"))
-            combo.setEnabled(True)
-        self.detecting.setText("Check each file's role. Files set to Ignore are not used.")
-        self._check()
+    @property
+    def add_target(self):
+        return self.target if self.destination.currentData() else None
 
-    def inputs(self) -> dict[str, list[Path]]:
-        result: dict[str, list[Path]] = {}
+    def inputs(self):
+        result = {}
         for path, combo in zip(self.paths, self.roles):
-            if combo.currentData() != "other":
+            if combo.currentData() not in {"", "other"}:
                 result.setdefault(combo.currentData(), []).append(path)
         return result
 
+    def invalidate(self):
+        self.generation += 1
+        self.jobs = None
+        self.side.clear()
+        self.scene.clear()
+        self.coverage.hide()
+        self.coverage.setChecked(False)
+        self._check()
+
     def _check(self):
         inputs = self.inputs()
-        problem = ""
-        if self._future is not None and not self._future.done():
-            problem = " "
-        elif len(inputs.get("outline", [])) != 1:
-            problem = "Choose exactly one board outline file."
-        elif not any(role in inputs for role in ROLE_LABELS if role.endswith(("copper", "mask", "silk"))):
-            problem = "Choose at least one copper, solder mask or silkscreen layer."
-        else:
-            for role, files in inputs.items():
-                if role != "drill" and len(files) > 1:
-                    problem = f"Only one file can be the {ROLE_LABELS[role].lower()}."
-            if not problem and "drill" not in inputs:
-                problem = ""   # allowed, but registration needs holes
-        self.problem.setText(problem.strip())
-        self.problem.setVisible(bool(problem.strip()))
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not problem)
+        roles = {role.split("_")[0] for role in inputs if "_" in role}
+        self.first.setEnabled(len(roles) == 2 and self.add_target is None)
+        self.flip.setEnabled("bottom" in roles and self.add_target is None)
+        self.width.setEnabled(self.mode.currentData() == "isolation")
+        reason = ""
+        if not self._detected_roles:
+            reason = "Reading layer roles…"
+        elif any(not combo.currentData() for combo in self.roles):
+            reason = "Choose a role or Ignore for every unrecognized file."
+        elif not roles:
+            reason = "Select at least one copper, solder mask or silkscreen layer."
+        elif any(role != "drill" and len(files) > 1 for role, files in inputs.items()):
+            reason = "Assign each role once. Multiple drill files are allowed."
+        elif self.add_target is None and not inputs.get("outline") and (
+            len(roles) == 2 or (self.mode.currentData() == "full" and any(r.endswith("_copper") for r in inputs))
+        ):
+            reason = "Add a closed outline for two sides or full clear."
+        self.review_button.setEnabled(not reason and self._pending is None)
+        self.kerf.setEnabled(self.mode.currentData() != "drawn" or any(r.endswith("_mask") for r in inputs))
+        self.add_button.setEnabled(bool(self.jobs) and self._reviewed == self.generation
+                                   and (self.coverage.isHidden() or self.coverage.isChecked()))
+        if reason:
+            self.problem.setText(reason)
+        elif not self.jobs and self._pending is None and self._reviewed != self.generation:
+            self.problem.setText("Preview the geometry to review it before adding the job.")
 
-    def settings(self) -> dict:
+    def settings(self):
         from ..pcb.inverter import InversionMode
 
-        return {
-            "mode": InversionMode.ISOLATION if self.mode.currentData() == "isolation" else InversionMode.FULL_INVERT,
-            "isolation_width": self.width.value(), "flip_axis": self.flip.currentData(), "kerf_mm": self.kerf.value(),
-        }
+        mode = {"isolation": InversionMode.ISOLATION, "full": InversionMode.FULL_INVERT,
+                "drawn": InversionMode.POSITIVE}[self.mode.currentData()]
+        return dict(mode=mode, isolation_width=self.width.value(), flip_axis=self.flip.currentData(),
+                    kerf_mm=self.kerf.value(), first_side=self.first.currentData(), allow_inferred=True)
+
+    def review(self):
+        from ..pcb.board import prepare_jobs
+
+        self.invalidate()
+        self._pending = self.generation
+        self.problem.setText("Preparing geometry…")
+        self._future = self.controller.executor.submit(
+            prepare_jobs, self.inputs(), self.controller.presets.defaults(), target=self.add_target, **self.settings())
+        self._check()
+
+    def _poll_result(self):
+        if not self._future.done():
+            return
+        if not self._detected_roles:
+            found = self._future.result()
+            for combo, role in zip(self.roles, found):
+                index = combo.findData(role) if role != "other" else 0
+                combo.setCurrentIndex(max(0, index))
+                combo.setEnabled(True)
+            self._detected_roles = True
+            self._check()
+            return
+        if self._pending is None:
+            return
+        generation, self._pending = self._pending, None
+        if generation != self.generation:
+            self._check()
+            return
+        self._reviewed = generation
+        try:
+            self.jobs = self._future.result()
+        except Exception as exc:
+            self.problem.setText(str(exc))
+        else:
+            self.side.clear()
+            for job in self.jobs:
+                self.side.addItem(job.name)
+            self.side.setVisible(len(self.jobs) > 1)
+            self.coverage.setVisible(any(job.inferred for job in self.jobs))
+            self.problem.setText("Inferred work area. Check that it fits the stock." if not self.coverage.isHidden()
+                                 else "Check the removal and registration before adding the job.")
+            self._draw()
+        self._check()
+
+    def _draw(self):
+        if not self.jobs or self.side.currentIndex() < 0:
+            return
+        job = self.jobs[self.side.currentIndex()]
+        self.scene.clear()
+
+        def draw(paths, color, *, fill=True, dashed=False):
+            if not paths:
+                return
+            shape = painter_path(paths, closed=fill)
+            pen = QPen(QColor(color), 0)
+            if dashed:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            self.scene.addPath(shape, pen, QBrush(QColor(color)) if fill else QBrush())
+
+        draw(job.retained, "#38866a")
+        for obj in job.objects:
+            if obj.kind in {COPPER_CONTOUR, CLEANUP}:
+                continue
+            color = "#dc843b" if obj.kind in {COPPER_FILL, ""} else obj.layer.color
+            draw(obj.fills or obj.paths, color, fill=bool(obj.fills))
+        draw(job.boundary, "#8794a8", fill=False, dashed=job.inferred)
+        bounds = self.scene.itemsBoundingRect()
+        if not bounds.isEmpty():
+            self.scene.setSceneRect(bounds.adjusted(-1, -1, 1, 1))
+            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "view") and not self.scene.sceneRect().isEmpty():
+            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _commit(self):
+        if self.add_button.isEnabled():
+            self.accept()
 
 
 class RegistrationDialog(QDialog):
@@ -189,7 +319,7 @@ class RegistrationDialog(QDialog):
         self.mode = QComboBox()
         if job.references:
             self.mode.addItem("Drilled holes" if job.holes else "Board corners", "holes")
-        if job.boundary:
+        if job.boundary and not job.inferred:
             self.mode.addItem("Board edge (edge cuts)", "edge")
         self.mode.currentIndexChanged.connect(self._mode_changed)
         layout.addLayout(row(QLabel("Register on"), self.mode, stretch=True))

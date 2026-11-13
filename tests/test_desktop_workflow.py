@@ -1,5 +1,6 @@
 from base64 import b64encode
 from dataclasses import replace
+from pathlib import Path
 import struct
 import threading
 import time
@@ -8,7 +9,7 @@ import pytest
 from shapely import affinity
 from shapely.geometry import Point, Polygon
 
-from mopa_luiz.desktop_hardware import HardwareWorker, execute_plan, protect_connection, set_waits
+from mopa_luiz.desktop_hardware import HardwareWorker
 from mopa_luiz.device_profile import DeviceProfile, import_ezcad, validate_cor
 from mopa_luiz.job_planner import Arming, compile_frame, compile_mark
 from mopa_luiz.pcb.board import InversionMode, detect_role, prepare_board, read_drills
@@ -164,51 +165,42 @@ DoorInPort=2
     validate_cor(correction_bytes() + bytes(4))   # EZCAD's JCZ_COR_2_1 files carry a short trailer
 
 
-class RecordingGalvo:
-    is_connected = True
-    delay_jump_short = 8
-    delay_jump_long = 200
-    galvos_per_mm = 327.675
+class WireConnection:
+    """A PyUSB-shaped connection that records galvoplotter's real packets."""
 
     def __init__(self):
-        self.calls = []
-        self.jump_delays = []
+        self.commands = []
+        self.packets = 0
+        self.wire = []
 
-    def marking_configuration(self):
-        pass
+    def write(self, endpoint, packet, timeout):
+        from galvo.consts import listJumpTo, listMarkTo
 
-    def initial_configuration(self):
-        pass
+        if len(packet) == 0xC00:
+            self.packets += 1
+            for code, x, y, *_ in struct.iter_unpack("<6H", bytes(packet)):
+                if code in {listJumpTo, listMarkTo}:
+                    self.wire.append(("jump" if code == listJumpTo else "mark", (x, y)))
+            time.sleep(0.001)
+        else:
+            self.commands.append(struct.unpack("<H", bytes(packet[:2]))[0])
+        return len(packet)
 
-    def is_ready(self):
-        return True
+    def read(self, endpoint, size, timeout):
+        return struct.pack("<4H", 0, 7, 9, 0x20)
 
-    def is_busy(self):
-        return False
 
-    def is_ready_and_not_busy(self):
-        return True
+def mock_driver(profile):
+    from mopa_luiz.desktop_hardware import open_controller
 
-    def set_delay_jump(self, delay):
-        self.jump_delays.append(delay)
-
-    def list_jump(self, x, y):
-        self.calls.append(("jump", (x, y)))
-
-    def mark(self, x, y):
-        self.calls.append(("mark", (x, y)))
-
-    def send(self, data, read=True):
-        return (-1, -1, -1, -1)
-
+    return open_controller(profile, WireConnection(), threading.Event(), lambda text: None)
 
 def make_job(paths):
     return Job("PCB", (Artwork("Artwork", paths, paths, replace(new_layer(), power_percent=5)),), job_id="test")
 
 
 def test_dense_job_keeps_every_path_and_long_contour_in_order():
-    from galvo.consts import listJumpTo, listMarkTo
-    from galvo.controller import GalvoController
+    from mopa_luiz.desktop_hardware import run_mark
 
     paths = tuple(((i / 1000, 0), (i / 1000, 5)) for i in range(30_000))
     long = tuple((i / 100, -5) for i in range(4501))
@@ -216,35 +208,15 @@ def test_dense_job_keeps_every_path_and_long_contour_in_order():
     plan = compile_mark(make_job((*paths, long)), profile, live=True)
     assert plan.paths == 30_001 and len(plan.batches[-1].paths) == 1
     assert plan.batches[-1].paths[0] == tuple(map(profile.galvo_point, long))
-    recorder = RecordingGalvo()
+    driver = mock_driver(profile)
     progress = []
-    execute_plan(recorder, plan, threading.Event(), lambda *counts: progress.append(counts))
+    run_mark(driver, plan, lambda *counts: progress.append(counts))
     expected = [
         ("jump" if i == 0 else "mark", profile.galvo_point(point))
         for path in (*paths, long) for i, point in enumerate(path)
     ]
-    assert recorder.calls == expected
+    assert driver.device.wire == expected
     assert progress[-1] == (len(plan.batches), len(plan.batches))
-
-    wire = []
-
-    class PacketConnection:
-        def is_open(self, index):
-            return True
-
-        def write(self, index, packet):
-            if len(packet) == 0xC00:
-                for code, x, y, *_ in struct.iter_unpack("<6H", packet):
-                    if code in {listJumpTo, listMarkTo}:
-                        wire.append(("jump" if code == listJumpTo else "mark", (x, y)))
-
-        def read(self, index):
-            return struct.pack("<4H", 0, 0, 0, 0x20)
-
-    driver = GalvoController(mock=True, galvos_per_mm=65535 / profile.width)
-    driver.connection = PacketConnection()
-    execute_plan(driver, plan, threading.Event(), lambda *_: None)
-    assert wire == expected
 
 
 def test_preflight_crosshatch_and_late_error():
@@ -285,34 +257,122 @@ def test_arm_expiration_one_shot_registration_and_project_resume(tmp_path):
     assert open_project(path) == [replace(job, status="interrupted")]
 
 
-def test_stop_disconnect_and_timeout_do_not_continue_a_batch():
+def test_stop_ends_a_mark_without_reporting_the_batch_complete():
+    from mopa_luiz.desktop_hardware import run_mark
+
     plan = compile_mark(make_job((((0, 0), (1, 0)), ((0, 1), (1, 1)))), enabled_profile(), live=True)
-    controller = RecordingGalvo()
-    stop = threading.Event()
-    record = controller.mark
+    driver = mock_driver(enabled_profile())
+    mark = driver.mark
 
     def stop_after_mark(*point):
-        record(*point)
-        stop.set()
+        mark(*point)
+        driver.stop.set()
 
-    controller.mark = stop_after_mark
+    driver.mark = stop_after_mark
     with pytest.raises(InterruptedError):
-        execute_plan(controller, plan, stop, lambda *_: pytest.fail("stopped batch reported complete"))
-    assert len(controller.calls) == 2
-    protect_connection(controller)
-    with pytest.raises(ConnectionError, match="acknowledge"):
-        controller.send(b"test")
-    controller.is_connected = False
-    with pytest.raises(ConnectionError, match="Lost"):
-        controller.send(b"test")
-    controller.is_ready = lambda: False
-    set_waits(controller, threading.Event(), 0)
-    with pytest.raises(TimeoutError):
-        controller.wait_ready()
+        run_mark(driver, plan, lambda *_: pytest.fail("stopped batch reported complete"))
 
 
-def test_spawned_mock_hardware_worker_runs_then_aborts_frame(monkeypatch):
+def test_a_board_that_never_gets_ready_stops_the_job_instead_of_being_written_to():
+    from mopa_luiz.desktop_hardware import frame_once
+
+    driver = mock_driver(enabled_profile())
+    driver.wait_seconds = 0.05
+    driver.device.read = lambda *args, **kwargs: struct.pack("<4H", 0, 7, 9, 0)
+    with pytest.raises(TimeoutError, match="ready"):
+        frame_once(driver, (((1000, 1000), (9000, 1000)),), 1)
+    assert driver.device.packets == 0
+
+
+@pytest.mark.parametrize("slots", [1, 2, 3])
+def test_streaming_starts_when_preload_fills_without_writing_past_ready(slots):
+    from galvo.consts import ExecuteList, GetVersion
+
+    from mopa_luiz.desktop_hardware import frame_loop
+
+    driver = mock_driver(enabled_profile())
+    wire = driver.device
+    write = wire.write
+    executing = False
+    ready = True
+    started_at = []
+    reports = []
+    driver.log = reports.append
+    driver.wait_seconds = 0.1
+
+    def send(endpoint, packet, timeout):
+        nonlocal executing, ready
+        if len(packet) == 0xC00:
+            assert ready, "driver wrote another list packet without READY"
+        elif int.from_bytes(packet[:2], "little") == ExecuteList:
+            assert not executing
+            started_at.append(wire.packets)
+            executing = True
+        return write(endpoint, packet, timeout)
+
+    def reply(endpoint, size, timeout):
+        nonlocal ready
+        if wire.commands[-1] == GetVersion:
+            ready = wire.packets < slots or executing
+        return struct.pack("<4H", 0, 33827, 9, 0x0220 if ready else 0x0200)
+
+    wire.write, wire.read = send, reply
+    laps, _ = frame_loop(driver, lambda: (((1000, 1000), (9000, 1000)),), seconds=0.02)
+    assert started_at == [slots] and wire.packets > slots and laps > 0
+    assert any("before start" in line for line in reports) == (slots < 3)
+
+
+def test_running_list_that_loses_ready_is_never_restarted_or_written_to():
+    from galvo.consts import ExecuteList, GetVersion
+
+    from mopa_luiz.desktop_hardware import frame_loop
+
+    driver = mock_driver(enabled_profile())
+    wire = driver.device
+    driver.wait_seconds = 0.03
+
+    def reply(endpoint, size, timeout):
+        blocked = wire.commands[-1] == GetVersion and wire.packets > 0
+        return struct.pack("<4H", 0, 33827, 9, 0x0204 if blocked else 0x0220)
+
+    wire.read = reply
+    with pytest.raises(TimeoutError, match=r"status 0x0204, 1 list packets sent, list executing"):
+        frame_loop(driver, lambda: (((1000, 1000), (9000, 1000)),))
+    assert wire.packets == 1
+    assert wire.commands.count(ExecuteList) == 1
+
+
+def test_first_failed_transfer_stops_the_frame_and_logs_what_led_to_it():
+    from mopa_luiz.desktop_hardware import frame_loop
+    from mopa_luiz.live import LinkLost
+
+    driver = mock_driver(enabled_profile())
+    wire = driver.device
+    write = wire.write
+    attempts = []
+    log = []
+    driver.log = log.append
+
+    def failing_write(endpoint, packet, timeout):
+        if wire.packets >= 5 and len(packet) == 0xC00:
+            attempts.append((endpoint, timeout))
+            return len(packet) - 1
+        return write(endpoint, packet, timeout)
+
+    wire.write = failing_write
+    with pytest.raises(LinkLost, match="short write"):
+        frame_loop(driver, lambda: (((1000, 1000), (9000, 1000), (1000, 1000)),))
+    assert len(attempts) == 1 and attempts[0][1] == 2000
+    assert any("USB write failed for list packet" in line for line in log)
+    assert any("GetVersion" in line for line in log)
+    sent = len(wire.commands)
+    with pytest.raises(LinkLost):
+        driver.get_version()
+    assert len(wire.commands) == sent
+
+def test_spawned_mock_hardware_worker_runs_then_aborts_frame(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENMOPA_MOCK", "1")
+    monkeypatch.setenv("STUDIOLASER_LOG_DIR", str(tmp_path))
     profile = enabled_profile()
     worker = HardwareWorker()
 
@@ -333,6 +393,8 @@ def test_spawned_mock_hardware_worker_runs_then_aborts_frame(monkeypatch):
         worker.start("mark", profile, plan)
         assert ("finished", "mark") in wait_for("idle")
         frame = compile_frame((((0, 0), (1, 1)),), profile)
+        worker.start("frame", profile, frame)
+        assert ("finished", "frame") in wait_for("idle")
         worker.start("frame-loop", profile, frame)
         wait_for("running")
         assert worker.update_frame(frame)
@@ -345,24 +407,240 @@ def test_spawned_mock_hardware_worker_runs_then_aborts_frame(monkeypatch):
             wait_for("idle")
 
 
+def test_connection_test_runs_every_step_against_the_simulated_laser(monkeypatch, tmp_path):
+    from mopa_luiz.desktop_hardware import TestOptions
+
+    monkeypatch.setenv("OPENMOPA_MOCK", "1")
+    monkeypatch.setenv("STUDIOLASER_LOG_DIR", str(tmp_path))
+    worker = HardwareWorker()
+    worker.start("test", enabled_profile(), TestOptions(seconds=1))
+    events = []
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not any(kind == "idle" for kind, _ in events):
+        events.extend(worker.poll())
+        time.sleep(0.025)
+    finished = [data for kind, data in events if kind == "test-step" and data[1] is not None]
+    assert len(finished) == 6 and all(ok for _, ok, _ in finished), events
+    assert ("finished", "test") in events
+
+
 def test_long_jumps_get_the_long_settle_delay():
+    from mopa_luiz.desktop_hardware import run_mark
+
     plan = compile_mark(make_job((((0, 0), (1, 0)), ((1.5, 0), (2, 0)), ((50, 0), (51, 0)))),
                         enabled_profile(), live=True)
-    controller = RecordingGalvo()
-    execute_plan(controller, plan, threading.Event(), lambda *_: None)
-    assert controller.jump_delays == [200, 8, 200]   # first move, short hop, long hop
+    driver = mock_driver(enabled_profile())
+    delays = []
+    set_delay = driver.set_delay_jump
+    driver.set_delay_jump = lambda delay: (delays.append(delay), set_delay(delay))
+    run_mark(driver, plan, lambda *_: None)
+    assert delays == [200, 8, 200]   # first move, short hop, long hop (galvoplotter's own defaults)
 
 
-def test_lights_out_clears_the_red_pointer_and_laser_gate():
-    from galvo.controller import GalvoController
+def test_frame_keeps_one_open_list_and_follows_moves_without_restarting():
+    from galvo.consts import ExecuteList, GetMarkTime, ResetList, StopExecute, WriteCorLine
 
-    from mopa_luiz.desktop_hardware import lights_out
+    from mopa_luiz.desktop_hardware import frame_loop
 
-    driver = GalvoController(mock=True)
-    driver.port_on(driver.light_pin)
-    driver.port_on(driver.laser_pin)
-    written = []
-    driver.write_port = lambda: written.append(driver._port_bits)
-    lights_out(driver)
-    assert not driver.is_port(driver.light_pin) and not driver.is_port(driver.laser_pin)
-    assert written and written[-1] & (1 << driver.light_pin) == 0
+    driver = mock_driver(enabled_profile())
+    wire = driver.device
+    frame = [(((1000, 1000), (9000, 1000), (9000, 9000), (1000, 1000)),)]
+
+    def run():
+        with pytest.raises(InterruptedError):
+            frame_loop(driver, lambda: frame[0])
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while wire.packets < 20 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert wire.packets >= 20
+        frame[0] = (((2000, 2000), (8000, 2000), (2000, 2000)),)
+        moved = len(wire.wire)
+        while ("jump", (8000, 2000)) not in wire.wire[moved:] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ("jump", (8000, 2000)) in wire.wire[moved:]
+    finally:
+        driver.stop.set()
+        worker.join(5)
+    assert wire.commands.count(ResetList) == 1 and wire.commands.count(ExecuteList) == 1
+    assert StopExecute not in wire.commands and GetMarkTime not in wire.commands
+    assert WriteCorLine not in wire.commands
+
+
+def test_connection_test_uses_original_motion_and_software_correction():
+    from mopa_luiz.desktop_hardware import open_controller
+
+    profile = replace(enabled_profile(), correction=b64encode(correction_bytes()).decode(), base="cor",
+                      driver="ezcad", jump_speed=4000)
+    args = profile, WireConnection(), threading.Event(), lambda text: None
+    regular = open_controller(*args)
+    diagnostic = open_controller(*args, diagnostic=True)
+    assert regular.travel_speed == 4000
+    assert diagnostic.travel_speed == diagnostic.light_speed == 3000
+    assert regular.cor_file is None and diagnostic.cor_file is None
+
+
+def test_diagnostic_handoff_waits_for_drain_in_one_spooler_task():
+    from contextlib import nullcontext
+
+    from galvo.consts import ExecuteList
+    from mopa_luiz import desktop_hardware as dh
+
+    driver = mock_driver(enabled_profile())
+    wire = driver.device
+    drain = threading.Event()
+    draining = threading.Event()
+    results = []
+    owners = set()
+    read = wire.read
+
+    def status(endpoint, size, timeout):
+        owners.add(threading.get_ident())
+        if wire.commands.count(ExecuteList) == 1 and not drain.is_set():
+            draining.set()
+            return struct.pack("<4H", 0, 7, 9, 0x24)
+        return read(endpoint, size, timeout)
+
+    wire.read = status
+    finished = threading.Event()
+
+    def step(name, action):
+        results.append((name, "started"))
+        action()
+        results.append((name, "passed"))
+
+    def task(c):
+        try:
+            results.append(dh.run_session(c, "test", enabled_profile(), dh.TestOptions(0.05), None,
+                                          results.append, nullcontext, step))
+        finally:
+            finished.set()
+        return True
+
+    driver.submit(task)
+    try:
+        assert draining.wait(3)
+        assert not any(name.startswith("Frame a 20") for name, _ in results)
+        assert len(driver._queue) == 1
+    finally:
+        drain.set()
+    assert finished.wait(5)
+    assert results[-1] == ("finished", "test")
+    assert len(owners) == 1 and wire.commands.count(ExecuteList) == 2
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_connection_test_verifies_stop_when_continuous_frame_stays_busy(stop_fails):
+    from contextlib import nullcontext
+
+    from galvo.consts import ExecuteList, GetSerialNo, StopExecute
+    from mopa_luiz import desktop_hardware as dh
+
+    profile = enabled_profile()
+    driver = mock_driver(profile)
+    wire = driver.device
+    driver.wait_seconds = 0.05
+    steps = []
+    log = []
+    driver.log = log.append
+
+    def status(endpoint, size, timeout):
+        if stop_fails and wire.commands[-1] == StopExecute:
+            raise OSError("Lost Stop acknowledgement")
+        # The dot drains, but the continuous square remains BUSY with READY set
+        # until an explicit StopExecute, as in the B6 report.
+        busy = wire.commands.count(ExecuteList) == 2 and StopExecute not in wire.commands
+        return struct.pack("<4H", 0, 7, 9, 0x0224 if busy else 0x0220)
+
+    wire.read = status
+
+    def step(name, action):
+        steps.append(name)
+        action()
+
+    def run():
+        return dh.run_session(driver, "test", profile, dh.TestOptions(0.02), None,
+                              lambda event: None, nullcontext, step)
+
+    if stop_fails:
+        with pytest.raises(dh.MachineStateUnknown, match="Stop could not be verified"):
+            run()
+        assert steps[-1] == "Verify stop" and wire.commands[-1] == StopExecute
+    else:
+        assert run() == ("finished", "test")
+        assert steps[-2:] == ["Verify stop", "Reconnect and handshake"]
+        assert GetSerialNo in wire.commands[wire.commands.index(StopExecute) + 1:]
+        assert any("Stop verified" in entry for entry in log)
+    assert wire.commands.count(StopExecute) == 1
+
+
+def test_mark_drain_failure_does_not_advance_to_the_next_batch():
+    from contextlib import nullcontext
+    from galvo.consts import GetVersion, ExecuteList
+    from mopa_luiz.desktop_hardware import MachineStateUnknown, run_session
+
+    profile = enabled_profile()
+    plan = compile_mark(make_job((((0, 0), (1, 1)),)), profile, live=True)
+    plan = replace(plan, batches=plan.batches * 2)
+    driver = mock_driver(profile)
+    wire = driver.device
+    read = wire.read
+    events = []
+
+    def fail_drain(endpoint, size, timeout):
+        if ExecuteList in wire.commands and wire.commands[-1] == GetVersion:
+            return b"\x00" * 4
+        return read(endpoint, size, timeout)
+
+    wire.read = fail_drain
+    with pytest.raises(MachineStateUnknown, match="invalid 4-byte reply"):
+        run_session(driver, "mark", profile, plan, None, events.append, nullcontext, None)
+    assert not any(kind == "progress" for kind, _ in events)
+    assert wire.commands[-1] == GetVersion and wire.commands.count(ExecuteList) == 1
+
+
+def test_stop_during_pending_transfer_uses_same_io_owner_and_sends_no_list():
+    from contextlib import nullcontext
+    from galvo.consts import GetVersion, ResetList, StopExecute, WritePort
+    from mopa_luiz.desktop_hardware import run_session
+
+    profile = enabled_profile()
+    driver = mock_driver(profile)
+    wire = driver.device
+    entered = threading.Event()
+    release = threading.Event()
+    owners = set()
+    read = wire.read
+
+    def block_first_ready(endpoint, size, timeout):
+        owners.add(threading.get_ident())
+        if ResetList in wire.commands and wire.commands[-1] == GetVersion and not entered.is_set():
+            entered.set()
+            assert release.wait(3)
+        return read(endpoint, size, timeout)
+
+    wire.read = block_first_ready
+    outcomes = []
+    paths = (((1000, 1000), (9000, 1000)),)
+
+    def run():
+        try:
+            run_session(driver, "frame", profile, paths, None, outcomes.append, nullcontext, None)
+        except InterruptedError:
+            outcomes.append(("stopped", None))
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert entered.wait(3)
+        driver.stop.set()
+    finally:
+        release.set()
+        worker.join(5)
+    assert outcomes[-1][0] == "stopped"
+    assert not any(kind == "running" for kind, _ in outcomes)
+    assert wire.packets == 0 and len(owners) == 1
+    assert StopExecute in wire.commands and WritePort in wire.commands[wire.commands.index(StopExecute):]

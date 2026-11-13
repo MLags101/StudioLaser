@@ -142,7 +142,8 @@ class Canvas(QGraphicsView):
         if job.boundary:
             # On a board everything inside the outline is copper until the laser removes it.
             fill = theme.color("copper_fill", 150 if job.side else 30)
-            add(painter_path(job.boundary, closed=True), cosmetic("field", 1.4), QBrush(fill), 0)
+            style = Qt.PenStyle.DashLine if job.inferred else Qt.PenStyle.SolidLine
+            add(painter_path(job.boundary, closed=True), cosmetic("field", 1.4, style), QBrush(fill), 0)
         if job.retained:
             add(painter_path(job.retained, closed=True), cosmetic("copper", 0.8), QBrush(theme.color("copper", 190)), 1)
         seen_fill = set()
@@ -389,7 +390,7 @@ class Canvas(QGraphicsView):
     def _nearest_edge(self, view_pos):
         """Closest point on the board outline to the cursor, as (design point, placed point), or None."""
         job = self.controller.job
-        if job is None or not job.boundary:
+        if job is None or job.inferred or not job.boundary:
             return None
         from ..workspace import nearest_on_paths
 

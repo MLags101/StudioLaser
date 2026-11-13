@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-import base64
 import math
 import os
 from pathlib import Path
@@ -18,18 +17,18 @@ from uuid import uuid4
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from ..artwork_files import ARTWORK_SUFFIXES, LAYER_SUFFIXES, artwork_for, job_for, read_layer  # noqa: F401
 from ..cli import pyusb_probe, usb_label
 from ..desktop_hardware import HardwareWorker
 from ..device_profile import DeviceProfile
-from ..job_planner import Arming, MarkPlan, compile_frame, compile_mark, format_duration
+from ..job_planner import Arming, MarkPlan, compile_frame, compile_mark, format_duration, layer_issues
 from ..live import mock_mode
 from ..patterns import crosshair, hole_targets
 from ..presets import PresetLibrary
 from ..workspace import (
-    Artwork, Job, Placement, flipped_placement, job_from_board, new_layer, open_project, rectangle, save_project,
+    Job, Placement, flipped_placement, job_from_board, open_project, rectangle, save_project,
 )
 
-ARTWORK_SUFFIXES = {".svg", ".dxf", ".stl"}
 FRAME_MODES = {
     "holes": "Outline and holes",
     "outline": "Outline",
@@ -39,7 +38,8 @@ FRAME_MODES = {
 HOLE_RING_MM = 0.4          # radius of the red ring traced at each drilled hole
 DESIGN_FRAME_LAP_S = 2.0     # a slower lap than this flickers too much to align by (and nears the frame timeout)
 LINK_TEXT = {
-    "connected": "Laser connected",
+    "connected": "Laser detected",
+    "responding": "Controller responding",
     "mock": "Simulated laser",
     "offline": "Laser offline",
     "multiple": "Choose a laser",
@@ -75,8 +75,11 @@ def probe_link(choice: str = "") -> tuple[str, str, list[dict]]:
     report = pyusb_probe()
     devices = report["devices"]
     if choice:
-        if any(device["key"] == choice for device in devices):
+        matches = [device for device in devices if device["key"] == choice]
+        if len(matches) == 1:
             return "connected", f"Using the laser on {usb_label(choice)}.", devices
+        if matches:
+            return "multiple", "More than one device matches the selected USB path.", devices
         return "missing", (f"The selected laser ({usb_label(choice)}) is not connected. Plug it in, or choose "
                            "another laser in this menu."), devices
     if len(devices) == 1:
@@ -102,21 +105,7 @@ def probe_driver() -> tuple[str, str] | None:
 
 
 def read_artwork(path: Path, width: float | None) -> Job:
-    if path.suffix.lower() == ".svg":
-        from ..svg_artwork import import_svg
-
-        artwork = import_svg(path, width)
-        vectors, fills = artwork.vectors, artwork.fills
-    else:
-        from ..importers import import_geometry
-
-        payload = "data:application/octet-stream;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
-        item = import_geometry(path.name, payload)
-        vectors = tuple(tuple(map(tuple, line)) for line in item["polylines"])
-        fills = tuple(line for line in vectors if len(line) > 3 and line[0] == line[-1])
-        if path.suffix.lower() == ".stl":
-            fills = ()   # A mesh projection is overlapping triangles; hatching it is meaningless.
-    return Job(path.stem, (Artwork(path.name, vectors, fills, new_layer()),), job_id=uuid4().hex)
+    return job_for(read_layer(path, width))
 
 
 class AppController(QObject):
@@ -130,7 +119,8 @@ class AppController(QObject):
     presets_changed = Signal()
     message = Signal(str, str)       # text, level: info | success | warning | error
     progress = Signal(float, float, str)   # seconds done, seconds total, label
-    size_required = Signal(object)   # Path of an SVG with no physical size
+    test_step = Signal(str, object, str)     # connection test: step name, True/False/None (running), detail
+    size_required = Signal(object, object)   # SVG with no physical size, and the job it was going into
 
     def __init__(self, state_dir: Path | None = None, *, autostart: bool = True):
         super().__init__()
@@ -143,6 +133,7 @@ class AppController(QObject):
         self.revision = 0
         self.arming = Arming()
         self.verified: set[str] = set()
+        self.preflight_failure: tuple[int, str] | None = None
         self.plan: MarkPlan | None = None
         self.target = None            # red-light paths that replace the job outline
         self.frame_mode = "holes"
@@ -242,7 +233,7 @@ class AppController(QObject):
 
     @property
     def online(self) -> bool:
-        return self.link in {"connected", "mock"}
+        return self.link in {"connected", "responding", "mock"}
 
     def is_verified(self, job: Job | None = None) -> bool:
         job = job or self.job
@@ -285,10 +276,25 @@ class AppController(QObject):
             return "Stop the red-light frame first" if self.framing else "The laser is busy"
         if self.planning:
             return "Planning…"
-        if job.side == "bottom" and self._top_unfinished(job):
-            return "Complete the top side of this board first"
+        if first := self.pending_first_side(job):
+            return f"Complete the {first.side} side of this board first"
+        if job.inferred and not self.is_verified(job):
+            return "Confirm alignment and that the stock covers the inferred work area"
+        if job.coupon and not self.is_verified(job):
+            return "Confirm the coupon is aligned on a fresh area of scrap"
         if job.side and not self.is_verified(job):
             return "Tick “Side and alignment checked” for this board side"
+        active = [obj for obj in job.objects if obj.layer.emits_when_marking()]
+        if not active:
+            return "Enable an engraving operation in Jobs"
+        for obj in active:
+            if job.coupon and obj.layer.frequency_khz != 37:
+                return f"{obj.name}: tuning coupons require 37 kHz"
+            error = next((text for level, text in layer_issues(obj.layer, self.profile) if level == "error"), "")
+            if error:
+                return f"{obj.name}: {error}"
+        if self.preflight_failure and self.preflight_failure[0] == self.revision:
+            return self.preflight_failure[1]
         return ""
 
     # ---- edits (all go through _commit so undo, arming and recovery stay consistent)
@@ -315,7 +321,8 @@ class AppController(QObject):
             was = old.get(job.job_id)
             if was is None or was is job:
                 continue
-            if was.placement != job.placement or (was.boundary is not job.boundary and was.boundary != job.boundary):
+            if (was.placement != job.placement or not same_geometry(was, job)
+                    or (was.origin, was.flip, was.inferred) != (job.origin, job.flip, job.inferred)):
                 self.verified.discard(job.job_id)
             # A settings edit makes a new job with the same geometry; keep its hull rather than recompute it.
             if "hull" in was.__dict__ and "hull" not in job.__dict__ and same_geometry(was, job):
@@ -443,9 +450,8 @@ class AppController(QObject):
         if job is None:
             return
         if checked:
-            if job.side == "bottom" and self._top_unfinished(job):
-                self.say("Finish the top side first, then flip the board and check the bottom side's alignment.",
-                         "warning")
+            if first := self.pending_first_side(job):
+                self.say(f"Finish the {first.side} side first, then flip and confirm alignment.", "warning")
                 self.state_changed.emit()
                 return
             self.verified.add(job.job_id)
@@ -478,8 +484,10 @@ class AppController(QObject):
 
     # ---- machine profile and presets
 
-    def set_profile(self, profile: DeviceProfile) -> bool:
-        if self.busy:
+    def set_profile(self, profile: DeviceProfile, *, while_framing: bool = False) -> bool:
+        """``while_framing`` allows a change that only moves where points land (a size trim) while the red
+        light runs: the frame is compiled here with the new profile, and the running connection is unaffected."""
+        if self.busy and not (while_framing and self.framing and not self.marking):
             self.say("Stop the laser before changing the machine profile", "warning")
             return False
         try:
@@ -500,23 +508,117 @@ class AppController(QObject):
 
     # ---- imports run off the UI thread
 
-    def import_artwork(self, paths: list[Path], width: float | None = None) -> None:
+    def import_artwork(self, paths: list[Path], width: float | None = None, *, into: str | None = None,
+                       together: bool = False) -> None:
+        """Read artwork files off the UI thread.
+
+        Each file becomes its own job, unless ``into`` names a job to add the files to as operations
+        (created if it no longer exists), or ``together`` puts all of them in one new job.
+        """
         if not paths or not self.can_edit():
             return
+        if together and into is None and len(paths) > 1:
+            into = uuid4().hex
         for path in paths:
-            self.tasks.append(("artwork", self.revision, self.executor.submit(self._read_artwork, path, width)))
-        self.say(f"Importing {len(paths)} file(s)…")
+            future = self.executor.submit(self._read_layer, path, width)
+            future.target = into
+            self.tasks.append(("layer" if into else "artwork", self.revision, future))
+        target = self.job_by_id(into)
+        self.say(f"Adding {len(paths)} file(s) to {target.name}…" if target else f"Importing {len(paths)} file(s)…")
+
+    def add_files_to_job(self, paths: list[Path]) -> None:
+        """Add files to the selected job as new operations (a new job when nothing is selected)."""
+        if self.job is None:
+            self.import_artwork(paths, together=True)
+        else:
+            self.import_artwork(paths, into=self.job.job_id)
 
     @staticmethod
-    def _read_artwork(path, width):
+    def _read_layer(path, width):
         from ..svg_artwork import SvgSizeRequired
 
         try:
-            return read_artwork(path, width)
+            return read_layer(path, width)
         except SvgSizeRequired:
             return ("size", path)
         except Exception as exc:
             raise ValueError(f"{path.name}: {exc}") from exc
+
+    def job_by_id(self, job_id: str | None) -> Job | None:
+        return next((job for job in self.jobs if job.job_id == job_id), None) if job_id else None
+
+    def _add_layer(self, job_id: str, file_layer) -> None:
+        """Append one file's geometry to a job as a new operation (or start the job with it)."""
+        defaults = self.presets.defaults()
+        index = next((i for i, job in enumerate(self.jobs) if job.job_id == job_id), None)
+        if index is None:
+            self.add_jobs([replace(job_for(file_layer, defaults), job_id=job_id)])
+            self.say(f"Imported {file_layer.name}", "success")
+            return
+        job = self.jobs[index]
+        artwork, note = artwork_for(file_layer, job, defaults)
+        jobs = list(self.jobs)
+        jobs[index] = replace(job, objects=job.objects + (artwork,))
+        self._commit(jobs, "Add file", current=index)
+        self.say(note or f"Added {file_layer.name} to {job.name} as a new operation. Choose its preset in Settings.",
+                 "warning" if note else "success")
+
+    # ---- operations within the current job
+
+    def _edit_objects(self, objects, label: str) -> None:
+        job = self.job
+        if job is not None and objects:
+            self.replace_job(replace(job, objects=tuple(objects)), label)
+
+    def rename_job(self, name: str) -> None:
+        name = name.strip()
+        if self.job is not None and name and name != self.job.name:
+            self.replace_job(replace(self.job, name=name), "Rename")
+
+    def rename_layer(self, index: int, name: str) -> None:
+        job, name = self.job, name.strip()
+        if job is None or not name or not 0 <= index < len(job.objects) or job.objects[index].name == name:
+            return
+        objects = list(job.objects)
+        objects[index] = replace(objects[index], name=name, layer=replace(objects[index].layer, name=name))
+        self._edit_objects(objects, "Rename operation")
+
+    def set_layer_kind(self, index: int, kind: str) -> None:
+        """What the operation is for: it decides which presets are listed first, and its colour."""
+        job = self.job
+        if job is None or not 0 <= index < len(job.objects) or job.objects[index].kind == kind:
+            return
+        objects = list(job.objects)
+        objects[index] = replace(objects[index], kind=kind)
+        self._edit_objects(objects, "Operation type")
+
+    def duplicate_layer(self, index: int) -> None:
+        job = self.job
+        if job is None or not 0 <= index < len(job.objects):
+            return
+        original = job.objects[index]
+        copy = replace(original, name=f"{original.name} (copy)",
+                       layer=replace(original.layer, layer_id=uuid4().hex[:8], name=f"{original.layer.name} (copy)"))
+        self._edit_objects(job.objects[:index + 1] + (copy,) + job.objects[index + 1:], "Duplicate operation")
+
+    def remove_layer(self, index: int) -> None:
+        job = self.job
+        if job is None or not 0 <= index < len(job.objects):
+            return
+        if len(job.objects) == 1:
+            self.say("A job needs at least one operation. Remove the job instead.", "warning")
+            return
+        self._edit_objects(job.objects[:index] + job.objects[index + 1:], "Remove operation")
+
+    def move_layer(self, index: int, delta: int) -> None:
+        """Operations run top to bottom; this changes the order."""
+        job = self.job
+        target = index + delta
+        if job is None or not (0 <= index < len(job.objects) and 0 <= target < len(job.objects)):
+            return
+        objects = list(job.objects)
+        objects.insert(target, objects.pop(index))
+        self._edit_objects(objects, "Reorder operations")
 
     def import_board(self, inputs: dict, *, mode, isolation_width: float, flip_axis: str, kerf_mm: float) -> None:
         if not self.can_edit():
@@ -536,6 +638,18 @@ class AppController(QObject):
 
         self.tasks.append(("board", self.revision, self.executor.submit(prepare)))
         self.say("Preparing copper, outline and drill geometry…")
+
+    def commit_gerber_import(self, jobs, target=None):
+        if not self.can_edit():
+            return
+        if target is None:
+            self.add_jobs(jobs)
+        elif self.job is target and target.status == "ready":
+            self.replace_job(jobs[0], "Add Gerber operations")
+        else:
+            self.say("The target job changed. Reopen Gerber import to review it again.", "warning")
+            return
+        self.say("Gerber prepared. Frame the stock and confirm alignment before arming.", "success")
 
     # ---- projects and recovery
 
@@ -671,21 +785,24 @@ class AppController(QObject):
         self.jobs_changed.emit()
         self.job_changed.emit()
 
-    def _top_unfinished(self, job: Job) -> bool:
-        return any(other.board_id == job.board_id and other.side == "top" and other.status != "complete"
-                   for other in self.jobs)
+    def pending_first_side(self, job: Job) -> Job | None:
+        if not job.board_id or not job.side or job.side == job.first_side:
+            return None
+        return next((other for other in self.jobs if other.board_id == job.board_id
+                     and other.side == job.first_side and other.status != "complete"), None)
 
     def _seed_other_side(self, finished_id: str) -> None:
-        """After the top side, start the bottom where an in-place flip would put it."""
-        top = next((job for job in self.jobs if job.job_id == finished_id), None)
-        if top is None or top.side != "top":
+        """Seed the second side where an in-place flip would put it."""
+        first = next((job for job in self.jobs if job.job_id == finished_id), None)
+        if first is None or not first.board_id or first.side != first.first_side:
             return
         for index, job in enumerate(self.jobs):
-            if job.board_id == top.board_id and job.side == "bottom" and job.placement == Placement():
-                self.jobs[index] = replace(job, placement=flipped_placement(top.placement))
+            if job.board_id == first.board_id and job.side and job.side != first.side and job.status == "ready":
+                if job.placement == Placement():
+                    self.jobs[index] = replace(job, placement=flipped_placement(first.placement))
                 self.verified.discard(job.job_id)
-                self.say("Top side complete. Flip the board, select the bottom side and align it (frame, or register on holes or edge) "
-                         "before running. Its position was pre-set from the top side as a starting point.", "success")
+                self.say(f"{first.side.title()} side complete. Flip the board, select the {job.side} side, "
+                         "and confirm its alignment before running.", "success")
 
     def frame(self, continuous: bool = True) -> None:
         reason = self.blockers()["frame"]
@@ -704,6 +821,25 @@ class AppController(QObject):
         self._frame_dirty = False
         self.say("Connecting to the laser for the red-light frame…")
         self.state_changed.emit()
+
+    def connection_test(self, options) -> bool:
+        """Run Machine → Connection Test (a desktop_hardware.TestOptions) on the selected laser."""
+        reason = "" if self.profile.enabled else "Enable the machine profile in Machine Setup first"
+        reason = reason or ("" if self.online else (self.link_note or LINK_TEXT[self.link]))
+        reason = reason or ("Stop the laser first" if self.busy else "")
+        reason = reason or ("Inspect the machine, then confirm it is idle." if self.state_unknown else "")
+        if reason:
+            self.say(reason, "warning")
+            return False
+        try:
+            self.arming.clear()
+            self.worker.start("test", self.profile, options, self.device_choice)
+        except Exception as exc:
+            self.say(f"The connection test did not start: {exc}", "error")
+            return False
+        self.say("Connection test started. Keep clear of the laser; only the red light is used.")
+        self.state_changed.emit()
+        return True
 
     def frame_paths(self):
         """What the red light traces now, in placed millimetres."""
@@ -818,8 +954,16 @@ class AppController(QObject):
         for kind, data in self.worker.poll():
             if kind == "status":
                 self.say(data)
+            elif kind == "responding":
+                if self.link != "mock":
+                    self.link = "responding"
+                    self.link_note = data
+            elif kind == "test-step":
+                self.test_step.emit(*data)
             elif kind == "running":
-                if data == "mark":
+                if data == "test":
+                    self.say("Connection test running")
+                elif data == "mark":
                     self._mark_started = time.monotonic()
                     total = self._running_plan.seconds
                     self.progress.emit(0.0, total, "Engraving")
@@ -838,6 +982,8 @@ class AppController(QObject):
                     self.progress.emit(1.0, 1.0, "")
                     self._finish("complete")
                     self.say(f"Job complete in {format_duration(took)}. Check the board before continuing.", "success")
+                elif data == "test":
+                    self.say("Connection test passed. The connection and the board are working.", "success")
                 else:
                     self.say("Red-light frame finished")
             elif kind in {"error", "unknown", "stopped", "timeout"}:
@@ -846,10 +992,16 @@ class AppController(QObject):
                     if self.running_id:
                         self.progress.emit(0.0, 0.0, "")
                     self._finish("interrupted")
-                if kind in {"unknown", "error", "timeout"}:
+                if kind == "unknown":
                     self.state_unknown = True
+                if self.link == "responding":
+                    self.link = "connected"
+                    self.link_note = data
                 self.say(data, "warning" if kind == "stopped" else "error")
             elif kind == "idle":
+                if self.link == "responding":
+                    self.link = "connected"
+                    self.link_note = "The USB device was detected. Its session has closed."
                 self._target_owned_loop = False
                 self._last_detect = 0.0
             self.state_changed.emit()
@@ -857,27 +1009,40 @@ class AppController(QObject):
     def _pump_tasks(self) -> None:
         if not self.marking:
             self._held_import_said = False
-        for task in [task for task in self.tasks if task[2].done()]:
+        ready = []
+        for position, task in enumerate(self.tasks):
+            # Files going into one job are added in the order they were chosen.
+            if task[2].done() and not (task[0] == "layer" and any(
+                    other[0] == "layer" and not other[2].done()
+                    and getattr(other[2], "target", None) == getattr(task[2], "target", None)
+                    for other in self.tasks[:position])):
+                ready.append(task)
+        for task in ready:
             self.tasks.remove(task)
             kind, revision, future = task
             try:
                 result = future.result()
             except Exception as exc:
+                if kind in {"arm", "preview"} and revision == self.revision:
+                    self.preflight_failure = (revision, str(exc))
                 self.say(exc, "error")
                 self.state_changed.emit()
                 continue
-            if kind in {"artwork", "board"} and self.marking:
+            if kind in {"artwork", "board", "layer"} and self.marking:
                 # The job list is locked while engraving; keep the result and add it afterwards.
                 self.tasks.append(task)
                 if not self._held_import_said:
                     self._held_import_said = True
                     self.say("The import finished during engraving; it will be added when the job ends.")
                 continue
-            if kind == "artwork":
+            if kind in {"artwork", "layer"}:
+                target = getattr(future, "target", None)
                 if isinstance(result, tuple):
-                    self.size_required.emit(result[1])
+                    self.size_required.emit(result[1], target)
+                elif kind == "layer":
+                    self._add_layer(target, result)
                 else:
-                    self.add_jobs([result])
+                    self.add_jobs([job_for(result, self.presets.defaults())])
                     self.say(f"Imported {result.name}", "success")
             elif kind == "board":
                 if result:
@@ -893,6 +1058,7 @@ class AppController(QObject):
                 # The job changed while it was being planned; say so instead of leaving "Planning…" up.
                 self.say("The job changed during planning. Preview or arm it again.", "warning")
             else:
+                self.preflight_failure = None
                 self.plan = result
                 self.plan_changed.emit()
                 summary = (f"{result.paths:,} paths, about {format_duration(result.seconds)}")
@@ -916,10 +1082,10 @@ class AppController(QObject):
             self._detect = None
             if link == "offline" and self.link == "driver":
                 link, note = "driver", self.link_note   # keep the driver diagnosis until the device is usable
-            if self.online and link not in {"connected", "mock"}:
+            if self.online and link not in {"connected", "mock"} and not self.busy:
                 self.arming.clear()
                 self.worker.stop()
-            if (link, note) != (self.link, self.link_note):
+            if not self.busy and (link, note) != (self.link, self.link_note):
                 self.link, self.link_note = link, note
         if self._driver_check is not None and self._driver_check.done():
             try:

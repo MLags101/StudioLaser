@@ -1,139 +1,323 @@
-"""One desktop hardware operation at a time, with cooperative Windows abort."""
+"""Run one desktop operation per process, with all controller I/O on its spooler."""
 
-from base64 import b64decode
-from contextlib import nullcontext, redirect_stdout
-from functools import partial
+from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+import math
 import multiprocessing as mp
 import os
-from pathlib import Path
-from tempfile import TemporaryDirectory
+import queue
 import threading
 import time
 
-from .cli import pyusb_probe
-from .job_planner import MarkPlan
-from .live import JobParams, connect_controller, mock_mode
+from .cli import describe_usb, pyusb_probe, usb_candidates, usb_label
+from .hardware_log import HardwareLog, build_id
+from .live import (
+    FRAME_LIGHT_SPEED_MM_S, WAIT_TIMEOUT_S, JobParams, LinkLost, OperatorStop, SimulatedDevice,
+    claim_device, make_controller, mock_mode,
+)
+from .usb_lock import lock_galvo
 
 
-# The 65 x 65 correction table is 4225 USB round trips; allow for a slow WinUSB link.
-CONNECT_SECONDS = 45.0
+CONNECT_SECONDS = 12.0
+FRAME_ONCE_SECONDS = 2.0
+FRAME_ONCE_MAX_COMMANDS = 20000
+LONG_JUMP_MM = 2.0
+STOP_GRACE_SECONDS = 15.0
 
 
-def check_stop(stop):
-    if stop.is_set():
-        raise InterruptedError("Operator stopped the hardware operation")
+@dataclass(frozen=True)
+class TestOptions:
+    seconds: float = 60.0
 
 
-def set_waits(controller, stop, timeout):
-    def wait_for(predicate, state):
-        deadline = time.monotonic() + timeout
-        while True:
-            check_stop(stop)
-            if predicate():
-                return
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"The galvo did not report {state}")
-            stop.wait(0.01)
-
-    controller.wait_ready = lambda: wait_for(controller.is_ready, "ready")
-    controller.wait_idle = lambda: wait_for(lambda: not controller.is_busy(), "idle")
-    controller.wait_finished = lambda: wait_for(controller.is_ready_and_not_busy, "completion")
+class MachineStateUnknown(RuntimeError):
+    """Communication or cleanup failed before the board could confirm idle."""
 
 
-def stream_paths(paths, jump, draw, stop):
+def resolve_device(choice):
+    devices, backend = usb_candidates()
+    if not backend["available"]:
+        raise ConnectionError(backend["note"])
+    candidates = [(device, describe_usb(device)) for device in devices]
+    if choice:
+        candidates = [(device, info) for device, info in candidates if info["key"] == choice]
+        if not candidates:
+            raise ConnectionError(f"The selected laser ({usb_label(choice)}) is not connected.")
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ConnectionError("No JCZ/LMC laser is connected")
+    if choice:
+        raise ConnectionError("More than one device matches the selected USB path.")
+    raise ConnectionError("More than one laser is connected. Choose which one to use in the menu at the top right.")
+
+
+def path_length_units(paths) -> float:
+    length, previous = 0.0, None
     for path in paths:
-        points = iter(path)
-        check_stop(stop)
-        jump(*next(points))
-        for point in points:
-            check_stop(stop)
-            draw(*point)
+        for point in path:
+            if previous is not None:
+                length += math.dist(previous, point)
+            previous = point
+    if previous is not None:
+        length += math.dist(previous, paths[0][0])
+    return length
 
 
-LONG_JUMP_MM = 2.0   # jumps longer than this get the long settle delay
+def frame_once_repeats(paths, units_per_mm, light_speed=FRAME_LIGHT_SPEED_MM_S):
+    seconds = max(path_length_units(paths) / units_per_mm / light_speed, 1e-3)
+    commands = max(1, sum(map(len, paths)))
+    return max(1, min(math.ceil(FRAME_ONCE_SECONDS / seconds), FRAME_ONCE_MAX_COMMANDS // commands, 500))
 
 
-def execute_plan(controller, plan: MarkPlan, stop, progress):
+def trace(controller, paths):
+    for path in paths:
+        controller.checkpoint()
+        controller.light_off()
+        controller.dark(*path[0])
+        for point in path[1:]:
+            controller.checkpoint()
+            controller.light(*point)
+
+
+def frame_once(controller, paths, repeats):
+    controller.lighting_configuration()
+    for _ in range(repeats):
+        trace(controller, paths)
+    finish_list(controller)
+
+
+def frame_loop(controller, read_frame, seconds=None):
+    """Use one open list. Start the timer when ExecuteList receives a valid reply."""
+    started = None
+    laps = 0
+    previous_callback = controller.on_execute
+
+    def executed():
+        nonlocal started
+        if started is None:
+            started = time.monotonic()
+        if previous_callback is not None:
+            previous_callback()
+
+    controller.on_execute = executed
+    controller.lighting_configuration()
+    startup_deadline = time.monotonic() + WAIT_TIMEOUT_S
+    next_stats = time.monotonic() + 10
+    try:
+        while True:
+            controller.checkpoint()
+            if started is None and time.monotonic() >= startup_deadline:
+                raise TimeoutError("The frame did not start")
+            if seconds is not None and started is not None and time.monotonic() - started >= seconds:
+                return laps, time.monotonic() - started
+            paths = read_frame()
+            trace(controller, paths)
+            laps += 1
+            if time.monotonic() >= next_stats:
+                controller.log(f"Framing: {laps} laps, {usb_stats(controller)}")
+                next_stats = time.monotonic() + 10
+    finally:
+        controller.on_execute = previous_callback
+
+
+def finish_list(controller):
+    controller.initial_configuration()
+    controller.outputs_off()
+    controller.wait_finished()
+    controller.log("List complete: outputs off, controller ready and idle")
+
+
+def run_mark(controller, plan, progress):
     long_units = LONG_JUMP_MM * abs(controller.galvos_per_mm)
-    last = [None]
-
-    def jump(x, y):
-        # Settle longer after a long move, or the first millimetre of the mark is bent.
-        far = last[0] is None or abs(complex(x, y) - complex(*last[0])) > long_units
-        controller.set_delay_jump(controller.delay_jump_long if far else controller.delay_jump_short)
-        controller.list_jump(x, y)
-        last[0] = (x, y)
-
-    def draw(x, y):
-        controller.mark(x, y)
-        last[0] = (x, y)
-
     for index, batch in enumerate(plan.batches, start=1):
-        check_stop(stop)
-        set_waits(controller, stop, batch.timeout)
+        controller.wait_seconds = batch.timeout
+        controller.deadline = time.monotonic() + batch.timeout + 10
         controller.power = batch.power
         controller.mark_speed = batch.speed
         controller.frequency = batch.frequency
         controller.pulse_width = batch.pulse_width
+        last = None
         controller.marking_configuration()
-        # Each planned path starts with a pen-up move, including the first
-        # path when the driver's cached start position happens to match it.
-        stream_paths(batch.paths, jump, draw, stop)
-        check_stop(stop)
-        controller.initial_configuration()
-        controller.wait_finished()
+        for path in batch.paths:
+            controller.checkpoint()
+            x, y = path[0]
+            far = last is None or math.dist((x, y), last) > long_units
+            controller.set_delay_jump(controller.delay_jump_long if far else controller.delay_jump_short)
+            controller.list_jump(x, y)
+            for point in path[1:]:
+                controller.checkpoint()
+                controller.mark(*point)
+            last = path[-1]
+        finish_list(controller)
+        controller.log(f"Batch {index}/{len(plan.batches)} complete ({batch.name})")
         progress(index, len(plan.batches))
+    controller.wait_seconds = WAIT_TIMEOUT_S
+    controller.deadline = None
 
 
-def protect_connection(controller):
-    """A lost command must fail the job instead of reconnecting mid-list."""
-    send = controller.send
-
-    def checked_send(data, read=True):
-        if not controller.is_connected:
-            raise ConnectionError("Lost the galvo USB connection")
-        reply = send(data, read)
-        if reply == (-1, -1, -1, -1):
-            raise ConnectionError("The galvo did not acknowledge a USB operation")
-        return reply
-
-    controller.send = checked_send
-    return send
+def open_controller(profile, device, stop, log, *, diagnostic=False):
+    params = JobParams("", 0, profile.min_hz / 1000, profile.pulse_widths[0], 10, 1000)
+    options = {}
+    if profile.driver == "ezcad" and not diagnostic:
+        options = {"light_speed": profile.frame_speed, "travel_speed": profile.jump_speed, **profile.delays}
+    log(f"Field {profile.width:g} mm; software correction={profile.base}; "
+        f"motion={'original' if diagnostic else profile.driver}")
+    return make_controller(device, stop, log, profile.config(), params, field_size_mm=profile.width, options=options)
 
 
-def lights_out(controller):
-    """Leave the red pointer and the laser gate off, whatever state the driver thinks it is in."""
-    controller.port_off(controller.light_pin)
-    controller.port_off(controller.laser_pin)
-    controller.write_port()
+def usb_stats(controller):
+    return (f"{controller.transfers} USB commands, longest wait {controller.longest_wait:.2f} s, "
+            f"slowest command {controller.slowest_transfer * 1000:.0f} ms")
 
 
-def resolve_device(choice: str) -> tuple[int, str]:
-    """galvoplotter opens "device number N" in libusb's order; turn the operator's choice into N.
+def test_step(send, log, name, action):
+    started = time.monotonic()
+    send(("test-step", (name, None, "")))
+    try:
+        detail = action() or ""
+    except Exception as exc:
+        took = time.monotonic() - started
+        log(f"Test {name}: {exc} ({took:.2f} s)")
+        send(("test-step", (name, False, f"{exc} ({took:.1f} s)")))
+        raise
+    took = time.monotonic() - started
+    log(f"Test {name}: passed ({took:.2f} s) {detail}")
+    send(("test-step", (name, True, f"{detail} ({took:.1f} s)".strip())))
 
-    Refuses rather than guessing: if the chosen laser is gone, the other one must not be opened.
-    """
-    from .cli import usb_label
 
-    devices = pyusb_probe()["devices"]
-    if choice:
-        for index, device in enumerate(devices):
-            if device["key"] == choice:
-                return index, choice
-        raise ConnectionError(f"The selected laser ({usb_label(choice)}) is not connected. Plug it in, or choose "
-                              "another laser in the menu at the top right.")
-    if len(devices) == 1:
-        return 0, devices[0]["key"]
-    if not devices:
-        raise ConnectionError("No JCZ/LMC laser is connected")
-    raise ConnectionError("More than one laser is connected. Choose which one to use in the menu at the top right.")
+def connection_test(controller, profile, options, step):
+    def dot():
+        # A finite list holds the visible guide at centre without filling the board's buffer.
+        controller.lighting_configuration()
+        controller.light_off()
+        controller.dark(0x8000, 0x8000)
+        controller.light_on()
+        for _ in range(6):
+            controller.list_delay_time(50_000)  # six 500 ms holds
+        controller.light_off()
+        before_execute = controller.on_execute
+        started = None
+
+        def executed():
+            nonlocal started
+            started = time.monotonic()
+
+        controller.on_execute = executed
+        try:
+            finish_list(controller)
+        finally:
+            controller.on_execute = before_execute
+        elapsed = time.monotonic() - started
+        return f"3.00 s programmed; execute to verified idle {elapsed:.2f} s"
+
+    def square():
+        half = round(10 * profile.units_per_mm)
+        low, high = 0x8000 - half, 0x8000 + half
+        paths = (((low, low), (high, low), (high, high), (low, high), (low, low)),)
+        laps, active = frame_loop(controller, lambda: paths, options.seconds)
+        # The next step uses the same verified Stop as an operator ending a
+        # continuous frame. The B6 can remain BUSY when a streamed list runs dry.
+        return f"active {active:.2f} s; {laps} laps"
+
+    step("Red dot at the centre for 3 s", dot)
+    step(f"Frame a 20 mm square for {options.seconds:g} s", square)
+
+
+def run_session(controller, action, profile, payload, read_frame, send, claim, step):
+    """The sole spooler task owns claim, handshake, lists, stop and release."""
+    diagnostic = action == "test"
+    may_have_output = False
+    identity = None
+    with ExitStack() as session:
+        try:
+            controller.deadline = time.monotonic() + CONNECT_SECONDS
+
+            def connect():
+                nonlocal may_have_output, identity
+                controller.checkpoint()
+                session.enter_context(claim())
+                identity = serial, firmware = controller.handshake()
+                may_have_output = True
+                controller.init_laser()
+                controller.outputs_off()
+                controller.wait_finished()
+                send(("responding", f"Serial {serial}, firmware {firmware}"))
+                return f"serial {serial}, firmware {firmware}"
+
+            if diagnostic:
+                step("Claim and handshake", connect)
+            else:
+                connect()
+            controller.deadline = None
+
+            if action in {"frame", "frame-loop"}:
+                def frame_started():
+                    controller.on_execute = None
+                    send(("running", action))
+
+                controller.on_execute = frame_started
+            else:
+                send(("running", action))
+
+            if diagnostic:
+                connection_test(controller, profile, payload, step)
+                may_have_output = False
+                try:
+                    step("Verify stop", controller.verified_stop)
+                except Exception as exc:
+                    controller.log(f"Stop unverified: {exc}")
+                    raise MachineStateUnknown(f"Stop could not be verified: {exc}") from exc
+            elif action == "mark":
+                run_mark(controller, payload, lambda n, total: send(("progress", (n, total))))
+            elif action == "frame":
+                controller.deadline = time.monotonic() + 30
+                repeats = frame_once_repeats(payload, profile.units_per_mm, controller.light_speed)
+                frame_once(controller, payload, repeats)
+                controller.deadline = None
+            else:
+                frame_loop(controller, read_frame)
+            controller.checkpoint()
+        except LinkLost as exc:
+            controller.log("Stop unverified: USB link failed")
+            raise MachineStateUnknown(str(exc)) from exc
+        except Exception as exc:
+            if may_have_output:
+                try:
+                    controller.verified_stop()
+                except Exception as stop_error:
+                    controller.log(f"Stop unverified: {stop_error}")
+                    raise MachineStateUnknown(f"{exc}. Stop could not be verified: {stop_error}") from stop_error
+            raise
+        finally:
+            controller.discard_list()
+
+    if diagnostic:
+        def reconnect():
+            with claim():
+                controller.deadline = time.monotonic() + CONNECT_SECONDS
+                serial, firmware = controller.handshake()
+                initial_serial, initial_firmware = identity
+                if (serial, firmware) != (initial_serial, initial_firmware):
+                    raise ConnectionError("The controller identity changed after reconnect")
+                controller.wait_finished()
+                return f"serial {serial}, firmware {firmware}"
+
+        step("Reconnect and handshake", reconnect)
+    controller.log(f"Session complete: {usb_stats(controller)}")
+    return "finished", action
 
 
 def hardware_operation(pipe, action, profile, payload, ready, device=""):
     stop = threading.Event()
-    frame = [payload]
-    pending_frame = threading.Event()
     done = threading.Event()
+    frames = queue.SimpleQueue()
+    messages = queue.SimpleQueue()
+    simulated = mock_mode()
+    log = HardwareLog(action != "detect" and not simulated)
+    started = time.monotonic()
+    frame = payload
 
     def listen():
         while not done.is_set():
@@ -145,115 +329,128 @@ def hardware_operation(pipe, action, profile, payload, ready, device=""):
                 stop.set()
                 return
             if command == "abort":
+                log("Stop requested")
                 stop.set()
                 return
             if command == "frame":
-                frame[0] = data
-                pending_frame.set()
+                frames.put(data)
 
-    controller = None
-    error = None
-    cleanup_failures = []
+    def read_frame():
+        nonlocal frame
+        try:
+            frame = frames.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            messages.put(("frame-ready", None))
+        return frame
+
+    def step(name, action):
+        return test_step(messages.put, log, name, action)
+
+    lease = None
+    listener = None
+    outcome = None
     try:
         if action == "detect":
             report = pyusb_probe()
-            ready.send(("detected", (mock_mode() or bool(report["devices"]), report.get("note", ""))))
+            ready.send(("detected", (simulated or bool(report["devices"]), report.get("note", ""))))
             return
+        if action not in {"test", "frame", "frame-loop", "mark"}:
+            raise ValueError(f"Unknown hardware operation {action}")
         listener = threading.Thread(target=listen, daemon=True)
         listener.start()
         profile.validate(live=True)
-        machine_index, device_key = (0, "simulated") if mock_mode() else resolve_device(device)
-        params = JobParams("", 0, profile.min_hz / 1000, profile.pulse_widths[0], 10, 1000)
-        original_send = None
-        with TemporaryDirectory(prefix="studiolaser-") as directory:
-            # Only a factory .cor goes to the board. Other bases upload a blank
-            # table and correct in software (DeviceProfile.galvo_point).
-            correction = None
-            if profile.base == "cor":
-                correction = Path(directory) / "active.cor"
-                correction.write_bytes(b64decode(profile.correction))
-                ready.send(("status", "Uploading the lens correction to the controller…"))
+
+        def find():
+            if simulated:
+                return SimulatedDevice(), {"key": "simulated", "address": None}
+            return resolve_device(device)
+
+        if action == "test":
+            ready.send(("test-step", ("Find the laser", None, "")))
+        try:
+            bound, info = find()
+        except Exception as exc:
+            if action == "test":
+                ready.send(("test-step", ("Find the laser", False, str(exc))))
+            raise
+        key = info["key"]
+        log(f"=== {action}; build={build_id() if not simulated else 'mock'}; "
+            f"{dependency_versions()}; USB path={key}, address={info['address']}")
+        if action == "test":
+            ready.send(("test-step", ("Find the laser", True, f"USB path {key}")))
+        if not simulated:
+            lease = lock_galvo(f"galvo-{key}")
+        controller = open_controller(profile, bound, stop, log, diagnostic=action == "test")
+        claim = nullcontext if simulated else lambda: claim_device(bound, log)
+        ready.send(("status", f"Laser detected on {usb_label(key)}. Opening the controller…"
+                    if not simulated else "Opening the simulated controller…"))
+
+        def task(c):
             try:
-                check_stop(stop)
-                simulated = mock_mode()
-                with open(os.devnull, "w") if simulated else nullcontext() as sink:
-                    with redirect_stdout(sink) if simulated else nullcontext():
-                        controller = connect_controller(
-                            profile.config(), params, CONNECT_SECONDS, field_size_mm=profile.width,
-                            lock_name=f"galvo-{device_key}",
-                            options={"machine_index": machine_index,
-                                     "cor_file": str(correction) if correction else None,
-                                     "light_speed": profile.frame_speed, "travel_speed": profile.jump_speed,
-                                     "galvos_per_mm": profile.units_per_mm, **profile.delays},
-                        )
-                if simulated:
-                    controller.connection.send = None
-                    controller.connection.recv = None
-                    controller.status = lambda: 0x20
-                else:
-                    # galvoplotter 0.2 retries a transfer through a USB reset
-                    # by default. An active mark must fail on the first error.
-                    connection = controller.connection
-                    connection.write = partial(connection.write, attempt=4)
-                    connection.read = partial(connection.read, attempt=4)
-                original_send = protect_connection(controller)
-                check_stop(stop)
-                ready.send(("running", action))
-                if action == "mark":
-                    execute_plan(controller, payload, stop, lambda n, total: ready.send(("progress", (n, total))))
-                else:
-                    set_waits(controller, stop, 15)
-                    deadline = time.monotonic() + 2
-                    last_heartbeat = 0
-                    while not stop.is_set() and (action == "frame-loop" or time.monotonic() < deadline):
-                        if pending_frame.is_set():
-                            pending_frame.clear()
-                            ready.send(("frame-ready", None))
-                        paths = frame[0]
-                        controller.lighting_configuration()
-                        stream_paths(paths, controller.dark, controller.light, stop)
-                        controller.light_off()
-                        check_stop(stop)
-                        controller.initial_configuration()
-                        controller.wait_finished()
-                        now = time.monotonic()
-                        if now - last_heartbeat >= 1:
-                            ready.send(("heartbeat", None))
-                            last_heartbeat = now
-                        stop.wait(0.04)
-                    check_stop(stop)
+                result = run_session(c, action, profile, payload, read_frame, messages.put, claim, step)
+            except MachineStateUnknown as exc:
+                result = ("unknown", f"Machine state unknown. {exc}. Use the machine's stop and verify it is idle.")
+            except OperatorStop as exc:
+                result = ("stopped", str(exc))
+            except Exception as exc:
+                result = ("error", str(exc) or type(exc).__name__)
             finally:
-                if controller is not None:
-                    # Cleanup must finish even after Stop: its waits get their own short deadline and
-                    # ignore the stop request (which is why we are here).
-                    set_waits(controller, threading.Event(), 5)
-                    # Avoid the driver's dummy list on cancel. It can flush a pending mark packet.
-                    for step in (lambda: controller.abort(dummy_packet=False), lambda: lights_out(controller)):
-                        try:
-                            step()
-                        except Exception as exc:
-                            cleanup_failures.append(exc)
-                    controller._sending = False
-                    if original_send is not None:
-                        controller.send = original_send
-                    try:
-                        controller.shutdown()
-                    except Exception as exc:
-                        cleanup_failures.append(exc)
-    except InterruptedError as exc:
-        error = ("stopped", str(exc))
+                c.discard_list()
+            messages.put(result)
+            return True
+
+        controller.submit(task)
+        spooler = controller._spooler_thread
+        next_beat = 0.0
+        last_transfers = 0
+        while outcome is None:
+            try:
+                name, data = messages.get(timeout=0.05)
+            except queue.Empty:
+                if (spooler is None or not spooler.is_alive()) and messages.empty():
+                    outcome = ("unknown", "The controller task ended without verifying the machine state.")
+            else:
+                if name in {"finished", "error", "stopped", "unknown"}:
+                    outcome = (name, data)
+                else:
+                    ready.send((name, data))
+            now = time.monotonic()
+            if now >= next_beat and outcome is None and controller.transfers != last_transfers:
+                last_transfers = controller.transfers
+                ready.send(("heartbeat", None))
+                next_beat = now + 1
+        if spooler is not None:
+            spooler.join()
     except Exception as exc:
-        error = ("error", str(exc))
+        outcome = outcome or ("error", str(exc) or type(exc).__name__)
     finally:
         done.set()
-        if cleanup_failures and (error is None or error[0] == "stopped"):
-            error = ("unknown", "The laser could not confirm it stopped and turned the laser and red light off "
-                                f"({cleanup_failures[0]}). Use the machine's own stop and check it.")
+        if listener is not None:
+            listener.join()
+        if lease is not None:
+            lease.close()
+        if outcome is not None:
+            log(f"--- {outcome[0]} after {time.monotonic() - started:.1f} s: {outcome[1]}")
+        log.close()
         try:
-            ready.send(error or ("finished", action))
+            if outcome is not None:
+                ready.send(outcome)
         finally:
             pipe.close()
             ready.close()
+
+
+def dependency_versions():
+    values = []
+    for package in ("galvoplotter", "pyusb", "libusb-package"):
+        try:
+            installed = version(package)
+        except PackageNotFoundError:
+            installed = "unavailable"
+        values.append(f"{package}={installed}")
+    return ", ".join(values)
 
 
 class HardwareWorker:
@@ -306,7 +503,8 @@ class HardwareWorker:
 
     def stop(self):
         if self.process and not self._abort_deadline:
-            self._abort_deadline = time.monotonic() + 8
+            # The process stops the board itself; killing it mid-USB-transfer is what wedges an LMC board.
+            self._abort_deadline = time.monotonic() + STOP_GRACE_SECONDS
             try:
                 self.commands.send(("abort", None))
             except (BrokenPipeError, OSError):
@@ -323,15 +521,17 @@ class HardwareWorker:
                 if name == "frame-ready":
                     self._frame_pending = False
                 if name == "heartbeat":
-                    self._deadline = time.monotonic() + 25
+                    self._deadline = max(self._deadline, time.monotonic() + 25)
+                if name == "test-step":   # the next step may be a connect, which can take a while
+                    self._deadline = max(self._deadline, time.monotonic() + CONNECT_SECONDS + 15)
                 if name == "running":
                     self._deadline = time.monotonic() + (
-                        self._batch_timeouts[0] + 10 if self._batch_timeouts else 25
+                        self._batch_timeouts[0] + 20 if self._batch_timeouts else 25
                     )
                 if name == "progress":
                     completed, total = data
                     self._deadline = time.monotonic() + (
-                        self._batch_timeouts[completed] + 10 if completed < total else 12
+                        self._batch_timeouts[completed] + 20 if completed < total else 20
                     )
                 if name in {"finished", "error", "stopped", "unknown"}:
                     self._saw_result = True
@@ -339,16 +539,17 @@ class HardwareWorker:
         except (EOFError, OSError):
             pass
         now = time.monotonic()
-        if alive:
+        if alive and not self._saw_result:
             if self._abort_deadline and now >= self._abort_deadline:
                 self.process.terminate()
                 self._saw_result = True
                 self._abort_deadline = float("inf")
-                events.append(("unknown", "Galvo stop could not be confirmed. Use the machine stop and verify its state."))
+                events.append(("unknown", "The laser process did not stop by itself and was ended. The controller "
+                                          "may need a power cycle; use the machine's own stop and check it."))
             elif not self._abort_deadline and now > self._deadline:
                 self.stop()
-                events.append(("timeout", "The hardware operation timed out. Stopping the galvo."))
-        else:
+                events.append(("timeout", "The laser stopped answering. Stopping the operation."))
+        elif not alive:
             self.process.join()
             self.process.close()
             self.results.close()
